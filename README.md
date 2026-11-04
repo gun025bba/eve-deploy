@@ -42,3 +42,10 @@ The workflow chain runs on `push` to `main` only, so a pull request (including f
 3. In `eve-serving` and `eve-web` rulesets: let GitHub Actions create tags (ruleset `release-tags`: add the GitHub Actions app to the bypass list).
 4. Cutover: set the repository variable `AUTO_RELEASE=on` in each repository. Until then the workflow does nothing and the old pipeline stays in charge.
 5. After two successful real deploys, remove the old pipeline (sudoers entry, Sigstore workflows, poller) in one reviewed PR.
+
+## Version check and migrations (BE decision, contract C4/C5)
+
+- After a gateway restart `bin/deploy` polls `EVE_VERSION_URL` (default `http://127.0.0.1:8000/_deploy/version`, loopback only) until the running version equals the deployed one, for at most `EVE_HEALTH_WAIT` seconds (default 90; startup migrations may take up to 30 s). A different running commit only produces a warning in the summary.
+- Restoring an older gateway (automatic rollback or `deploy rollback`) accepts a 404 from that endpoint (binaries from before the endpoint existed) and then checks health only. `EVE_VERSION_CHECK=off` disables the version check.
+- The gateway migrates its own database at start (`GW_DB_AUTO_MIGRATE=true` in the production launchd plist: set by `host/setup.sh` for the live plist and by `deploy/launchd-go/gateway.plist.template` for new installs). The deploy account has no database credentials; a rollback is the previous binary (migrations are forward-only and expand-only).
+- `manifest.json` is optional: if the release has one, component and version must match.

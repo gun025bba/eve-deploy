@@ -14,7 +14,7 @@ sha_of() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{
 # ---------- fake host ----------
 export EVE_ROOT=$T/root EVE_RESTART_DONE=$T/done EVE_HEALTH_WAIT=4 EVE_RESTART_WAIT=6
 PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
-export EVE_HEALTH_URL=http://127.0.0.1:$PORT/health EVE_UI_URL=http://127.0.0.1:$PORT/ui/
+export EVE_HEALTH_URL=http://127.0.0.1:$PORT/health EVE_UI_URL=http://127.0.0.1:$PORT/ui/ EVE_VERSION_URL=http://127.0.0.1:$PORT/_deploy/version
 mkdir -p "$EVE_ROOT/bin" "$EVE_ROOT/web"
 cat >"$T/srv.py" <<PY
 import http.server, os, json
@@ -26,8 +26,10 @@ class H(http.server.BaseHTTPRequestHandler):
         if self.path == "/health": code = 503 if os.path.exists(T+"/unhealthy") else 200
         elif self.path.startswith("/ui/"):
             f = ROOT+"/web/index.html"; code = 200 if os.path.exists(f) and b"BAD" not in open(f,"rb").read() else 503
-        elif self.path == "/version":
-            code = 200; body = json.dumps({"version": open(T+"/running").read().strip()}).encode()
+        elif self.path == "/_deploy/version":
+            # like the gateway: loopback only (no proxy headers), 404 for everything else; 404 as well for an old binary that has no such endpoint
+            if self.headers.get("X-Forwarded-For") or os.path.exists(T+"/noendpoint"): code = 404
+            else: code = 200; body = json.dumps({"version": open(T+"/running").read().strip(), "commit": "unknown"}).encode()
         self.send_response(code); self.end_headers(); self.wfile.write(body)
 http.server.HTTPServer(("127.0.0.1",$PORT),H).serve_forever()
 PY
@@ -36,7 +38,8 @@ python3 "$T/srv.py" & SRV=$!
 ( last=""; while :; do cur=$(cat "$EVE_ROOT/restart.trigger" 2>/dev/null || true)
   if [ -n "$cur" ] && [ "$cur" != "$last" ]; then last=$cur
     if grep -q UNHEALTHY "$EVE_ROOT/bin/gateway" 2>/dev/null; then : >"$T/unhealthy"; else rm -f "$T/unhealthy"; fi
-    "$EVE_ROOT/bin/gateway" -version >"$T/running" 2>/dev/null
+    if grep -q NOENDPOINT "$EVE_ROOT/bin/gateway" 2>/dev/null; then : >"$T/noendpoint"; else rm -f "$T/noendpoint"; fi
+    if ! grep -q STALE "$EVE_ROOT/bin/gateway" 2>/dev/null; then "$EVE_ROOT/bin/gateway" -version >"$T/running" 2>/dev/null; fi   # STALE: the old process keeps running (restart did not take)
     printf '%s.%s\n' "$(date +%s)" "$RANDOM" >"$EVE_RESTART_DONE"; fi; sleep 0.2; done ) & WAT=$!
 sleep 1
 
@@ -102,10 +105,25 @@ else ok "tar with .. path refused (tar cannot build the sample here: skipped)"; 
 mkdir -p "$T/ln/in" && ( cd "$T/ln/in" && printf '#!/bin/sh\nexit 0\n' >gateway && chmod +x gateway && ln -s /etc/passwd eve-gw && tar -czf ../eve-gateway-1.5.1-darwin-arm64.tar.gz gateway eve-gw )
 H=$(sha_of "$T/ln/eve-gateway-1.5.1-darwin-arm64.tar.gz"); echo "$H  x" >"$T/ln/eve-gateway-1.5.1-darwin-arm64.tar.gz.sha256"; printf '{"component":"gateway","version":"1.5.1","commit":"x"}\n' >"$T/ln/manifest.json"
 $D deploy gateway 1.5.1 --from "$T/ln" >/dev/null 2>&1; check "tar with a symlink refused" "$?" 1
-# version endpoint contract (C4)
-export EVE_VERSION_URL=http://127.0.0.1:$PORT/version
-G6=$(mk_gw 1.6.0); $D deploy gateway 1.6.0 --from "$G6" >/dev/null 2>&1; check "deploy with a version endpoint" "$?" 0
-unset EVE_VERSION_URL
+# version endpoint (C4): the new version must be the one that answers; a stale process is rolled back
+G6=$(mk_gw 1.6.0 STALE); $D deploy gateway 1.6.0 --from "$G6" >/dev/null 2>&1; check "stale process (wrong version answers) is rolled back" "$?" 1
+check "stale process: status" "$(res status)" rolled-back
+check "stale process: still on the old version" "$(cat "$EVE_ROOT/state/gateway.version")" 1.0.0
+# a release without manifest.json (made by hand) deploys
+G7=$(mk_gw 1.7.0); rm "$G7/manifest.json"; $D deploy gateway 1.7.0 --from "$G7" >/dev/null 2>&1; check "release without manifest.json deploys" "$?" 0
+# the proxied/tailnet path gets 404 (loopback only)
+check "version endpoint refuses a proxied request" "$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Forwarded-For: 100.64.0.1' "$EVE_VERSION_URL")" 404
+check "version endpoint answers on loopback" "$(curl -s -o /dev/null -w '%{http_code}' "$EVE_VERSION_URL")" 200
+# an older gateway without the endpoint: strict deploy refuses it, restoring it (rollback) works
+G8=$(mk_gw 0.9.0 NOENDPOINT); $D deploy gateway 0.9.0 --from "$G8" >/dev/null 2>&1; check "new version without the endpoint fails the strict check" "$?" 1
+EVE_VERSION_CHECK=off $D deploy gateway 0.9.0 --from "$G8" >/dev/null 2>&1; check "EVE_VERSION_CHECK=off installs it on health only" "$?" 0
+G9=$(mk_gw 0.9.1 UNHEALTHY); $D deploy gateway 0.9.1 --from "$G9" >/dev/null 2>&1
+check "restore of an old gateway without the endpoint is accepted" "$(res status)" rolled-back
+check "...and the old binary is back" "$("$EVE_ROOT/bin/gateway" -version)" 0.9.0
+$D deploy gateway 2.0.0 --from "$(mk_gw 2.0.0)" >/dev/null 2>&1; check "deploy over it works" "$?" 0
+# the production plist template turns on startup migrations (BE decision, C5)
+grep -q '<key>GW_DB_AUTO_MIGRATE</key><string>true</string>' "$R/deploy/launchd-go/gateway.plist.template" && ok "plist template sets GW_DB_AUTO_MIGRATE=true" || bad "plist template sets GW_DB_AUTO_MIGRATE=true"
+grep -q 'GW_DB_AUTO_MIGRATE' "$R/host/setup.sh" && ok "host setup sets GW_DB_AUTO_MIGRATE in the live plist" || bad "host setup sets GW_DB_AUTO_MIGRATE in the live plist"
 # a lock left by a running deploy blocks a second one
 mkdir "$EVE_ROOT/state/lock"; $D deploy gateway 1.7.0 --from "$G6" >/dev/null 2>&1; check "second deploy while one runs is refused" "$?" 1; rmdir "$EVE_ROOT/state/lock"
 

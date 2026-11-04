@@ -16,8 +16,9 @@ EVE_REPO_GATEWAY=${EVE_REPO_GATEWAY:-eve-serving}
 EVE_REPO_WEB=${EVE_REPO_WEB:-eve-web}
 EVE_HEALTH_URL=${EVE_HEALTH_URL:-http://127.0.0.1:8000/health}
 EVE_UI_URL=${EVE_UI_URL:-http://127.0.0.1:8000/ui/}
-EVE_VERSION_URL=${EVE_VERSION_URL:-}          # optional loopback endpoint returning {"version":"X.Y.Z"} (BE contract C4); empty = health check only
-EVE_HEALTH_WAIT=${EVE_HEALTH_WAIT:-60}        # seconds the new version has to become healthy
+EVE_VERSION_URL=${EVE_VERSION_URL:-http://127.0.0.1:8000/_deploy/version}   # loopback only, {"version","commit"} (BE contract C4). Call it with a plain Host (127.0.0.1) and no X-Forwarded-*: anything else gets 404.
+EVE_VERSION_CHECK=${EVE_VERSION_CHECK:-strict}   # strict: the running version must equal the one deployed | off: health only (a gateway without /_deploy/version)
+EVE_HEALTH_WAIT=${EVE_HEALTH_WAIT:-90}        # seconds the new version has to become healthy (startup migrations may take up to 30 s)
 EVE_RESTART_TRIGGER=${EVE_RESTART_TRIGGER:-$EVE_ROOT/restart.trigger}   # touching this file makes the root watcher restart the gateway
 EVE_RESTART_DONE=${EVE_RESTART_DONE:-/var/db/eve-restart/done}          # written by the root watcher after each restart (root-owned dir)
 EVE_RESTART_WAIT=${EVE_RESTART_WAIT:-30}
@@ -46,21 +47,31 @@ json_get() { sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p
 
 # ----- health -----
 http_ok() { curl -fsS -m 5 -o /dev/null "$1" 2>/dev/null; }
-wait_healthy() { # $1 component $2 expected version ; polls for EVE_HEALTH_WAIT seconds
-  local i=0 url=$EVE_HEALTH_URL body
+wait_healthy() { # $1 component $2 expected version $3 mode: strict (default) | tolerant (restoring an older gateway that has no version endpoint: 404 = health only)
+  local i=0 url=$EVE_HEALTH_URL body code mode=${3:-strict}
   [ "$1" = web ] && url=$EVE_UI_URL
   while [ "$i" -lt "$EVE_HEALTH_WAIT" ]; do
     if http_ok "$url"; then
-      if [ "$1" = gateway ] && [ -n "$EVE_VERSION_URL" ]; then
-        body=$(curl -fsS -m 5 "$EVE_VERSION_URL" 2>/dev/null || true)
-        case "$body" in *"\"version\":\"$2\""*|*"\"version\": \"$2\""*) return 0;; esac
-      else
-        return 0
-      fi
+      if [ "$1" = web ] || [ "$EVE_VERSION_CHECK" = off ] || [ -z "$EVE_VERSION_URL" ]; then return 0; fi
+      body=$(curl -sS -m 5 -w '\n%{http_code}' "$EVE_VERSION_URL" 2>/dev/null || true)
+      code=${body##*$'\n'}; body=${body%$'\n'*}
+      case "$code:$body" in
+        200:*"\"version\":\"$2\""*|200:*"\"version\": \"$2\""*) RUNNING_COMMIT=$(printf '%s' "$body" | sed -n 's/.*"commit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'); return 0;;
+        404:*) [ "$mode" = tolerant ] && return 0;;
+      esac
     fi
     i=$((i + 1)); sleep 1
   done
   return 1
+}
+# a commit that differs from the manifest is a warning only (the version matched); it shows up in the job summary
+check_commit() { # $1 manifest
+  [ -f "$1" ] || return 0
+  local want; want=$(json_get "$1" commit)
+  if [ -n "${RUNNING_COMMIT:-}" ] && [ "$RUNNING_COMMIT" != unknown ] && [ -n "$want" ] && [ "$RUNNING_COMMIT" != "$want" ]; then
+    log "warning: running commit $RUNNING_COMMIT differs from the release commit $want"; summary "warning: running commit differs from the release commit"
+  fi
+  return 0
 }
 
 # ----- gateway restart without sudo: touch the trigger, a root watcher (installed once) kickstarts the service and writes EVE_RESTART_DONE -----
@@ -82,7 +93,7 @@ fetch_release() { # $1 component $2 version $3 outdir
   if [ "$1" = gateway ]; then repo=$EVE_REPO_GATEWAY; asset="eve-gateway-$2-darwin-arm64"; else repo=$EVE_REPO_WEB; asset="eve-web-$2"; fi
   base="https://github.com/$EVE_OWNER/$repo/releases/download/v$2"
   for f in "$asset.tar.gz" "$asset.tar.gz.sha256" manifest.json; do
-    curl -fsSL --proto '=https' --tlsv1.2 --retry "$EVE_FETCH_RETRIES" --retry-delay 3 --retry-all-errors -o "$3/$f" "$base/$f" || return 1
+    curl -fsSL --proto '=https' --tlsv1.2 --retry "$EVE_FETCH_RETRIES" --retry-delay 3 --retry-all-errors -o "$3/$f" "$base/$f" || { [ "$f" = manifest.json ] && { rm -f "$3/$f"; continue; }; return 1; }   # manifest.json is optional (a release made by hand has none)
   done
   printf '%s' "$asset"
 }
@@ -90,7 +101,7 @@ verify_release() { # $1 component $2 version $3 dir $4 asset
   local want got
   want=$(awk '{print $1; exit}' "$3/$4.tar.gz.sha256"); got=$(sha_of "$3/$4.tar.gz")
   [[ "$want" =~ ^[0-9a-f]{64}$ ]] && [ "$want" = "$got" ] || return 1
-  [ "$(json_get "$3/manifest.json" component)" = "$1" ] && [ "$(json_get "$3/manifest.json" version)" = "$2" ] || return 2
+  if [ -f "$3/manifest.json" ]; then [ "$(json_get "$3/manifest.json" component)" = "$1" ] && [ "$(json_get "$3/manifest.json" version)" = "$2" ] || return 2; fi
   if tar -tzf "$3/$4.tar.gz" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then return 3; fi
   if tar -tvzf "$3/$4.tar.gz" | grep -Eq '^[lh]'; then return 3; fi      # no symlinks or hard links inside a release
   return 0
@@ -137,7 +148,7 @@ do_deploy() { # $1 component $2 version $3 from-dir (may be empty)
   if [ "$FROM_V" = "$2" ]; then STATUS=unchanged; HEALTH=ok; log "$1 $2 is already live: nothing to do"; write_result; return 0; fi
   if [ -n "$3" ]; then
     if [ "$1" = gateway ]; then asset="eve-gateway-$2-darwin-arm64"; else asset="eve-web-$2"; fi
-    cp "$3/$asset.tar.gz" "$3/$asset.tar.gz.sha256" "$3/manifest.json" "$work/" || die "missing artifact files in $3"
+    cp "$3/$asset.tar.gz" "$3/$asset.tar.gz.sha256" "$work/" || die "missing artifact files in $3"; [ -f "$3/manifest.json" ] && cp "$3/manifest.json" "$work/"
   else
     log "downloading $1 $2"
     asset=$(fetch_release "$1" "$2" "$work") || die "download failed for $1 $2 (the release may not exist yet)"
@@ -150,12 +161,12 @@ do_deploy() { # $1 component $2 version $3 from-dir (may be empty)
     [ "$("$work/new/gateway" -version 2>/dev/null)" = "$2" ] || die "the new gateway binary does not run here or reports another version"
     log "installing gateway $2 (was ${FROM_V:-none})"
     install_gateway_files "$work/new" || { restore_gateway_files; die "cannot install the gateway files"; }
-    if restart_gateway && wait_healthy gateway "$2"; then
+    if restart_gateway && wait_healthy gateway "$2" && check_commit "$work/manifest.json"; then
       HEALTH=ok; STATUS=success; commit_gateway_files; echo "$FROM_V" >"$ST/gateway.previous"; echo "$2" >"$ST/gateway.version"
       log "gateway $2 is live"; write_result; return 0
     fi
     log "gateway $2 did not become healthy within ${EVE_HEALTH_WAIT}s: restoring ${FROM_V:-the previous files}"
-    restore_gateway_files; restart_gateway; wait_healthy gateway "$FROM_V" && HEALTH=restored || HEALTH=restore-failed
+    restore_gateway_files; restart_gateway; wait_healthy gateway "$FROM_V" tolerant && HEALTH=restored || HEALTH=restore-failed
     STATUS=rolled-back; log "rolled back ($HEALTH)"; write_result; exit 1
   else
     log "installing web $2 (was ${FROM_V:-none})"
@@ -180,7 +191,7 @@ do_rollback() { # $1 component
     local tmp; tmp=$(mktemp -d "$ST/swap.XXXXXX") || die "cannot create a work dir"
     cp -p "$BIN/gateway" "$tmp/gateway"; [ -f "$BIN/eve-gw" ] && cp -p "$BIN/eve-gw" "$tmp/eve-gw"
     local f; for f in gateway eve-gw; do [ -f "$PREV_BIN/$f" ] && cp -p "$PREV_BIN/$f" "$BIN/$f.new" && mv -f "$BIN/$f.new" "$BIN/$f"; done
-    if restart_gateway && wait_healthy gateway "$TO_V"; then
+    if restart_gateway && wait_healthy gateway "$TO_V" tolerant; then
       mkdir -p "$PREV_BIN"; cp -p "$tmp/gateway" "$PREV_BIN/gateway"; [ -f "$tmp/eve-gw" ] && cp -p "$tmp/eve-gw" "$PREV_BIN/eve-gw"
       echo "$TO_V" >"$ST/gateway.version"; echo "$FROM_V" >"$ST/gateway.previous"; STATUS=success; HEALTH=ok
     else

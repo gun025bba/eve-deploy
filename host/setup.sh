@@ -38,6 +38,25 @@ chown root:wheel /Library/LaunchDaemons/com.eve.restart-watcher.plist; chmod 644
 launchctl bootout system/com.eve.restart-watcher 2>/dev/null || true
 launchctl bootstrap system /Library/LaunchDaemons/com.eve.restart-watcher.plist
 
+echo "== gateway: migrations on startup (GW_DB_AUTO_MIGRATE=true)"
+# BE decision (C5): the gateway applies its own forward-only migrations at start; the deploy step never touches the database.
+# Only this one key of the live plist is changed (a backup is kept next to it); nothing is printed from the plist. It takes effect at the next restart = the next deploy.
+GW_PLIST=${GW_PLIST:-/Library/LaunchDaemons/com.llmserving.gateway.plist}
+PB=/usr/libexec/PlistBuddy
+if [ -f "$GW_PLIST" ]; then
+  if [ "$("$PB" -c 'Print :EnvironmentVariables:GW_DB_AUTO_MIGRATE' "$GW_PLIST" 2>/dev/null || true)" = true ]; then
+    echo "  already true"
+  else
+    cp -p "$GW_PLIST" "$GW_PLIST.pre-eve-deploy" && chmod 600 "$GW_PLIST.pre-eve-deploy"
+    "$PB" -c 'Print :EnvironmentVariables' "$GW_PLIST" >/dev/null 2>&1 || "$PB" -c 'Add :EnvironmentVariables dict' "$GW_PLIST"
+    "$PB" -c 'Set :EnvironmentVariables:GW_DB_AUTO_MIGRATE true' "$GW_PLIST" >/dev/null 2>&1 || "$PB" -c 'Add :EnvironmentVariables:GW_DB_AUTO_MIGRATE string true' "$GW_PLIST"
+    plutil -lint "$GW_PLIST" >/dev/null || { echo "plist is not valid after the change; restoring the backup" >&2; cp -p "$GW_PLIST.pre-eve-deploy" "$GW_PLIST"; exit 1; }
+    echo "  set to true (backup: $GW_PLIST.pre-eve-deploy); active at the next gateway restart"
+  fi
+else
+  echo "  $GW_PLIST not found: set GW_DB_AUTO_MIGRATE=true in the gateway's launchd environment yourself (or re-run with GW_PLIST=<path>)"
+fi
+
 echo "== 3/3 self-hosted runners"
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 curl -fsSL --retry 5 -o "$TMP/$RUNNER_ASSET" "https://github.com/actions/runner/releases/download/v$RUNNER_VERSION/$RUNNER_ASSET"
