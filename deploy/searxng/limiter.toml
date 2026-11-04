@@ -1,0 +1,17 @@
+# SearXNG bot-detection. Only the gateway on the same host talks to SearXNG,
+# arriving through the docker port-forward; trust only loopback/bridge.
+[botdetection]
+ipv4_prefix = 32
+ipv6_prefix = 48
+trusted_proxies = ["127.0.0.0/8", "::1"]
+
+[botdetection.ip_limit]
+link_token = false
+
+[botdetection.ip_lists]
+# pass_ip: requests from these addresses skip the limiter (the gateway).
+# Measured after install: colima's port-forward lands on docker-proxy, so SearXNG
+# sees the bridge gateway of the pinned "searxng" network (docker-compose.yml) as
+# the source. Exactly that /32, nothing wider (review item 2).
+pass_ip = ["172.18.0.1/32"]
+block_ip = []

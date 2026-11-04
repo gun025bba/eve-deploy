@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eve.restart-watcher</string>
+  <key>ProgramArguments</key><array><string>/usr/local/libexec/eve-restart-watcher</string></array>
+  <key>WatchPaths</key><array><string>__EVE_ROOT__/restart.trigger</string></array>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>StandardErrorPath</key><string>/var/log/eve-restart-watcher.log</string>
+</dict></plist>

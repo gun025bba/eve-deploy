@@ -1,0 +1,45 @@
+#!/bin/bash
+# Builds the release files of one component (run by the app repositories' release workflows):
+#   pack gateway --version X.Y.Z --commit SHA --gateway FILE [--eve-gw FILE] --out DIR
+#   pack web     --version X.Y.Z --commit SHA --web-dir DIR [--exclude ERE] --out DIR   (packs the files git tracks in DIR)
+# Output in DIR: <asset>.tar.gz, <asset>.tar.gz.sha256 and manifest.json (component, version, commit, built_at).
+#   gateway asset = eve-gateway-X.Y.Z-darwin-arm64     web asset = eve-web-X.Y.Z
+# No signing: sha256 only (the deploy step checks it against the download; it catches transfer errors).
+set -euo pipefail
+export LC_ALL=C COPYFILE_DISABLE=1
+die() { echo "pack: $*" >&2; exit 1; }
+sha_of() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
+[ $# -ge 1 ] || die "usage: pack gateway|web --version V --commit SHA ..."
+KIND=$1; shift
+VER=""; SHA=""; GW=""; EG=""; WEBDIR=""; OUT=""; EXCL='^(\.github/|tests/|review-shots/|README\.md$|AGENTS\.md$|\.gitignore$|\.gitattributes$)'
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --version) VER=${2:-}; shift 2;; --commit) SHA=${2:-}; shift 2;; --gateway) GW=${2:-}; shift 2;; --eve-gw) EG=${2:-}; shift 2;;
+    --web-dir) WEBDIR=${2:-}; shift 2;; --exclude) EXCL=${2:-}; shift 2;; --out) OUT=${2:-}; shift 2;;
+    *) die "unknown argument: $1";;
+  esac
+done
+[ "$KIND" = gateway ] || [ "$KIND" = web ] || die "component must be gateway or web"
+[[ "$VER" =~ ^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$ ]] || die "--version must be X.Y.Z"
+[[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || die "--commit must be 40 lowercase hex"
+[ -n "$OUT" ] || die "--out is required"
+mkdir -p "$OUT"; OUT=$(cd "$OUT" && pwd -P)
+T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+if [ "$KIND" = gateway ]; then
+  ASSET="eve-gateway-$VER-darwin-arm64"
+  [ -f "$GW" ] || die "--gateway FILE is required"
+  mkdir "$T/t"; cp "$GW" "$T/t/gateway"; chmod 755 "$T/t/gateway"
+  if [ -n "$EG" ]; then [ -f "$EG" ] || die "--eve-gw file not found"; cp "$EG" "$T/t/eve-gw"; chmod 755 "$T/t/eve-gw"; fi
+  (cd "$T/t" && tar -czf "$OUT/$ASSET.tar.gz" $(ls | sort))
+else
+  ASSET="eve-web-$VER"
+  [ -d "$WEBDIR" ] || die "--web-dir DIR is required"
+  mkdir "$T/t"
+  (cd "$WEBDIR" && git ls-files -z | tr '\0' '\n' | grep -Ev "$EXCL" | sort >"$T/list" || true)
+  [ -s "$T/list" ] || die "no files to pack in $WEBDIR"
+  (cd "$WEBDIR" && tar -czf "$OUT/$ASSET.tar.gz" -T "$T/list")
+fi
+H=$(sha_of "$OUT/$ASSET.tar.gz")
+printf '%s  %s\n' "$H" "$ASSET.tar.gz" >"$OUT/$ASSET.tar.gz.sha256"
+printf '{\n  "component": "%s",\n  "version": "%s",\n  "commit": "%s",\n  "built_at": "%s",\n  "sha256": "%s"\n}\n' "$KIND" "$VER" "$SHA" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$H" >"$OUT/manifest.json"
+echo "pack: $OUT/$ASSET.tar.gz ($H)"

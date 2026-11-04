@@ -1,0 +1,214 @@
+#!/bin/bash
+# eve-deploy entry point. Runs as an ordinary (non-root, non-admin) user: no sudo anywhere.
+#
+#   deploy deploy   gateway|web VERSION [--from DIR]   install release VERSION of a component (default: download it from the GitHub release)
+#   deploy rollback gateway|web                        go back to the one previous version this script kept
+#
+# Exit 0 = the requested version (or, for rollback, the previous one) is live and healthy. Any failure after the swap restores the
+# previous version automatically. The outcome is written to $EVE_ROOT/state/result.json and, in CI, to the job summary.
+# Integrity: sha256 of the tarball only (a transport check, not a signature). Written for macOS /bin/bash 3.2 and BSD tools.
+set -uo pipefail
+export LC_ALL=C
+
+EVE_ROOT=${EVE_ROOT:-/opt/eve-gw}
+EVE_OWNER=${EVE_OWNER:-gun025bba}
+EVE_REPO_GATEWAY=${EVE_REPO_GATEWAY:-eve-serving}
+EVE_REPO_WEB=${EVE_REPO_WEB:-eve-web}
+EVE_HEALTH_URL=${EVE_HEALTH_URL:-http://127.0.0.1:8000/health}
+EVE_UI_URL=${EVE_UI_URL:-http://127.0.0.1:8000/ui/}
+EVE_VERSION_URL=${EVE_VERSION_URL:-}          # optional loopback endpoint returning {"version":"X.Y.Z"} (BE contract C4); empty = health check only
+EVE_HEALTH_WAIT=${EVE_HEALTH_WAIT:-60}        # seconds the new version has to become healthy
+EVE_RESTART_TRIGGER=${EVE_RESTART_TRIGGER:-$EVE_ROOT/restart.trigger}   # touching this file makes the root watcher restart the gateway
+EVE_RESTART_DONE=${EVE_RESTART_DONE:-/var/db/eve-restart/done}          # written by the root watcher after each restart (root-owned dir)
+EVE_RESTART_WAIT=${EVE_RESTART_WAIT:-30}
+EVE_FETCH_RETRIES=${EVE_FETCH_RETRIES:-5}
+
+BIN=$EVE_ROOT/bin; WEB=$EVE_ROOT/web; ST=$EVE_ROOT/state
+PREV_BIN=$EVE_ROOT/previous/bin; PREV_WEB=$EVE_ROOT/previous/web; STAGE_BIN=$EVE_ROOT/previous/bin.stage
+
+now() { date '+%Y-%m-%dT%H:%M:%S%z'; }
+log() { printf '%s %s\n' "$(now)" "$*" | tee -a "$ST/deploy.log" 2>/dev/null; }
+summary() { [ -n "${GITHUB_STEP_SUMMARY:-}" ] && printf '%s\n' "$*" >>"$GITHUB_STEP_SUMMARY"; return 0; }
+STARTED=$(now); COMPONENT=""; FROM_V=""; TO_V=""; STATUS=failed; HEALTH=unknown
+write_result() {
+  mkdir -p "$ST" 2>/dev/null || return 0
+  printf '{"component":"%s","from":"%s","to":"%s","status":"%s","started_at":"%s","finished_at":"%s","health":"%s"}\n' \
+    "$COMPONENT" "$FROM_V" "$TO_V" "$STATUS" "$STARTED" "$(now)" "$HEALTH" >"$ST/result.json.tmp" && mv -f "$ST/result.json.tmp" "$ST/result.json"
+  summary "### eve-deploy: $COMPONENT $FROM_V -> $TO_V: **$STATUS** (health: $HEALTH)"
+}
+die() { log "FAIL: $*"; printf 'deploy: %s\n' "$*" >&2; write_result; exit 1; }
+
+valid_version() { [[ "$1" =~ ^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$ ]]; }
+sha_of() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
+cur_version() { cat "$ST/$1.version" 2>/dev/null || true; }
+prev_version() { cat "$ST/$1.previous" 2>/dev/null || true; }
+json_get() { sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" "$1" | head -1; }
+
+# ----- health -----
+http_ok() { curl -fsS -m 5 -o /dev/null "$1" 2>/dev/null; }
+wait_healthy() { # $1 component $2 expected version ; polls for EVE_HEALTH_WAIT seconds
+  local i=0 url=$EVE_HEALTH_URL body
+  [ "$1" = web ] && url=$EVE_UI_URL
+  while [ "$i" -lt "$EVE_HEALTH_WAIT" ]; do
+    if http_ok "$url"; then
+      if [ "$1" = gateway ] && [ -n "$EVE_VERSION_URL" ]; then
+        body=$(curl -fsS -m 5 "$EVE_VERSION_URL" 2>/dev/null || true)
+        case "$body" in *"\"version\":\"$2\""*|*"\"version\": \"$2\""*) return 0;; esac
+      else
+        return 0
+      fi
+    fi
+    i=$((i + 1)); sleep 1
+  done
+  return 1
+}
+
+# ----- gateway restart without sudo: touch the trigger, a root watcher (installed once) kickstarts the service and writes EVE_RESTART_DONE -----
+restart_gateway() {
+  local before after i=0
+  before=$(cat "$EVE_RESTART_DONE" 2>/dev/null || echo 0)
+  printf '%s.%s\n' "$(date '+%s')" "$RANDOM" >"$EVE_RESTART_TRIGGER" || return 1
+  while [ "$i" -lt "$EVE_RESTART_WAIT" ]; do
+    after=$(cat "$EVE_RESTART_DONE" 2>/dev/null || echo 0)
+    [ "$after" != "$before" ] && return 0
+    i=$((i + 1)); sleep 1
+  done
+  return 1
+}
+
+# ----- fetch + verify -----
+fetch_release() { # $1 component $2 version $3 outdir
+  local repo base asset f
+  if [ "$1" = gateway ]; then repo=$EVE_REPO_GATEWAY; asset="eve-gateway-$2-darwin-arm64"; else repo=$EVE_REPO_WEB; asset="eve-web-$2"; fi
+  base="https://github.com/$EVE_OWNER/$repo/releases/download/v$2"
+  for f in "$asset.tar.gz" "$asset.tar.gz.sha256" manifest.json; do
+    curl -fsSL --proto '=https' --tlsv1.2 --retry "$EVE_FETCH_RETRIES" --retry-delay 3 --retry-all-errors -o "$3/$f" "$base/$f" || return 1
+  done
+  printf '%s' "$asset"
+}
+verify_release() { # $1 component $2 version $3 dir $4 asset
+  local want got
+  want=$(awk '{print $1; exit}' "$3/$4.tar.gz.sha256"); got=$(sha_of "$3/$4.tar.gz")
+  [[ "$want" =~ ^[0-9a-f]{64}$ ]] && [ "$want" = "$got" ] || return 1
+  [ "$(json_get "$3/manifest.json" component)" = "$1" ] && [ "$(json_get "$3/manifest.json" version)" = "$2" ] || return 2
+  if tar -tzf "$3/$4.tar.gz" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then return 3; fi
+  return 0
+}
+
+# ----- swap helpers (rename within the same filesystem; the previous tree/binaries are kept for rollback) -----
+install_gateway_files() { # $1 dir with new gateway + eve-gw. The files being replaced are staged in previous/bin.stage until the new version is healthy.
+  mkdir -p "$BIN" "$EVE_ROOT/previous" || return 1
+  rm -rf "$STAGE_BIN"; mkdir "$STAGE_BIN" || return 1
+  local f
+  for f in gateway eve-gw; do [ -f "$BIN/$f" ] && cp -p "$BIN/$f" "$STAGE_BIN/$f"; done
+  for f in gateway eve-gw; do
+    [ -f "$1/$f" ] || continue
+    cp "$1/$f" "$BIN/$f.new" && chmod 755 "$BIN/$f.new" && mv -f "$BIN/$f.new" "$BIN/$f" || return 1
+  done
+}
+restore_gateway_files() { # put back what install_gateway_files staged (a failed deploy keeps the older previous/bin untouched)
+  local f; for f in gateway eve-gw; do [ -f "$STAGE_BIN/$f" ] && cp -p "$STAGE_BIN/$f" "$BIN/$f.new" && mv -f "$BIN/$f.new" "$BIN/$f"; done; return 0
+}
+commit_gateway_files() { rm -rf "$PREV_BIN"; mv "$STAGE_BIN" "$PREV_BIN"; }
+install_web_tree() { # $1 new tree dir (becomes $WEB); the old one becomes $PREV_WEB; the older previous waits in $PREV_WEB.old until success
+  mkdir -p "$EVE_ROOT/previous" || return 1
+  rm -rf "$PREV_WEB.old"; [ -d "$PREV_WEB" ] && mv "$PREV_WEB" "$PREV_WEB.old"
+  [ -d "$WEB" ] && { mv "$WEB" "$PREV_WEB" || return 1; }
+  mv "$1" "$WEB" || { [ -d "$PREV_WEB" ] && mv "$PREV_WEB" "$WEB"; [ -d "$PREV_WEB.old" ] && mv "$PREV_WEB.old" "$PREV_WEB"; return 1; }
+  chmod -R go+rX "$WEB" 2>/dev/null; return 0
+}
+commit_web_tree() { rm -rf "$PREV_WEB.old"; }
+restore_web_tree() {
+  rm -rf "$WEB.failed"; [ -d "$WEB" ] && mv "$WEB" "$WEB.failed"
+  [ -d "$PREV_WEB" ] && mv "$PREV_WEB" "$WEB"
+  [ -d "$PREV_WEB.old" ] && mv "$PREV_WEB.old" "$PREV_WEB"
+  rm -rf "$WEB.failed"; return 0
+}
+
+# ----- commands -----
+do_deploy() { # $1 component $2 version $3 from-dir (may be empty)
+  COMPONENT=$1; TO_V=$2; FROM_V=$(cur_version "$1")
+  valid_version "$2" || die "bad version '$2'"
+  local work asset rc
+  mkdir -p "$ST" || die "cannot create $ST"
+  work=$(mktemp -d "$ST/work.XXXXXX") || die "cannot create a work dir"
+  WORK=$work
+  if [ "$FROM_V" = "$2" ]; then STATUS=unchanged; HEALTH=ok; log "$1 $2 is already live: nothing to do"; write_result; return 0; fi
+  if [ -n "$3" ]; then
+    if [ "$1" = gateway ]; then asset="eve-gateway-$2-darwin-arm64"; else asset="eve-web-$2"; fi
+    cp "$3/$asset.tar.gz" "$3/$asset.tar.gz.sha256" "$3/manifest.json" "$work/" || die "missing artifact files in $3"
+  else
+    log "downloading $1 $2"
+    asset=$(fetch_release "$1" "$2" "$work") || die "download failed for $1 $2 (the release may not exist yet)"
+  fi
+  verify_release "$1" "$2" "$work" "$asset"; rc=$?
+  [ "$rc" = 0 ] || die "artifact check failed (code $rc: 1 sha256, 2 manifest component/version, 3 unsafe tar path)"
+  mkdir -p "$work/new" && tar -xzf "$work/$asset.tar.gz" -C "$work/new" || die "cannot unpack the tarball"
+  if [ "$1" = gateway ]; then
+    [ -x "$work/new/gateway" ] || chmod +x "$work/new/gateway" 2>/dev/null
+    [ "$("$work/new/gateway" -version 2>/dev/null)" = "$2" ] || die "the new gateway binary does not run here or reports another version"
+    log "installing gateway $2 (was ${FROM_V:-none})"
+    install_gateway_files "$work/new" || { restore_gateway_files; die "cannot install the gateway files"; }
+    if restart_gateway && wait_healthy gateway "$2"; then
+      HEALTH=ok; STATUS=success; commit_gateway_files; echo "$FROM_V" >"$ST/gateway.previous"; echo "$2" >"$ST/gateway.version"
+      log "gateway $2 is live"; write_result; return 0
+    fi
+    log "gateway $2 did not become healthy within ${EVE_HEALTH_WAIT}s: restoring ${FROM_V:-the previous files}"
+    restore_gateway_files; restart_gateway; wait_healthy gateway "$FROM_V" && HEALTH=restored || HEALTH=restore-failed
+    STATUS=rolled-back; log "rolled back ($HEALTH)"; write_result; exit 1
+  else
+    log "installing web $2 (was ${FROM_V:-none})"
+    install_web_tree "$work/new" || die "cannot install the web tree"
+    if wait_healthy web "$2"; then
+      HEALTH=ok; STATUS=success; commit_web_tree; echo "$FROM_V" >"$ST/web.previous"; echo "$2" >"$ST/web.version"
+      log "web $2 is live"; write_result; return 0
+    fi
+    log "web $2 failed its health check: restoring ${FROM_V:-the previous tree}"
+    restore_web_tree; wait_healthy web "$FROM_V" && HEALTH=restored || HEALTH=restore-failed
+    STATUS=rolled-back; log "rolled back ($HEALTH)"; write_result; exit 1
+  fi
+}
+
+do_rollback() { # $1 component
+  COMPONENT=$1; FROM_V=$(cur_version "$1"); TO_V=$(prev_version "$1")
+  mkdir -p "$ST" || die "cannot create $ST"
+  [ -n "$TO_V" ] || die "no previous $1 version is kept"
+  log "rolling $1 back $FROM_V -> $TO_V"
+  if [ "$1" = gateway ]; then
+    [ -f "$PREV_BIN/gateway" ] || die "no previous gateway binary is kept"
+    local tmp; tmp=$(mktemp -d "$ST/swap.XXXXXX") || die "cannot create a work dir"
+    cp -p "$BIN/gateway" "$tmp/gateway"; [ -f "$BIN/eve-gw" ] && cp -p "$BIN/eve-gw" "$tmp/eve-gw"
+    local f; for f in gateway eve-gw; do [ -f "$PREV_BIN/$f" ] && cp -p "$PREV_BIN/$f" "$BIN/$f.new" && mv -f "$BIN/$f.new" "$BIN/$f"; done
+    if restart_gateway && wait_healthy gateway "$TO_V"; then
+      mkdir -p "$PREV_BIN"; cp -p "$tmp/gateway" "$PREV_BIN/gateway"; [ -f "$tmp/eve-gw" ] && cp -p "$tmp/eve-gw" "$PREV_BIN/eve-gw"
+      echo "$TO_V" >"$ST/gateway.version"; echo "$FROM_V" >"$ST/gateway.previous"; STATUS=success; HEALTH=ok
+    else
+      HEALTH=unhealthy; STATUS=failed
+    fi
+    rm -rf "$tmp"
+  else
+    [ -d "$PREV_WEB" ] || die "no previous web tree is kept"
+    local keep="$EVE_ROOT/previous/web.swap"; rm -rf "$keep"; mv "$WEB" "$keep" && mv "$PREV_WEB" "$WEB" && mv "$keep" "$PREV_WEB" || die "cannot swap the web trees"
+    if wait_healthy web "$TO_V"; then echo "$TO_V" >"$ST/web.version"; echo "$FROM_V" >"$ST/web.previous"; STATUS=success; HEALTH=ok; else HEALTH=unhealthy; STATUS=failed; fi
+  fi
+  write_result; [ "$STATUS" = success ]
+}
+
+usage() { echo "usage: deploy deploy gateway|web VERSION [--from DIR] | deploy rollback gateway|web" >&2; exit 2; }
+[ $# -ge 2 ] || usage
+CMD=$1; COMP=$2; shift 2
+case "$COMP" in gateway|web) ;; *) usage;; esac
+mkdir -p "$ST" 2>/dev/null
+LOCK=$ST/lock
+mkdir "$LOCK" 2>/dev/null || { if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +30 2>/dev/null)" ]; then rm -rf "$LOCK"; mkdir "$LOCK" || usage; else echo "deploy: another deploy is running" >&2; exit 1; fi; }
+WORK=""
+cleanup() { [ -n "$WORK" ] && rm -rf "$WORK"; rmdir "$LOCK" 2>/dev/null; return 0; }
+trap cleanup EXIT
+case "$CMD" in
+  deploy)
+    [ $# -ge 1 ] || usage; VER=$1; shift; FROMDIR=""
+    if [ "${1:-}" = "--from" ]; then FROMDIR=${2:-}; [ -d "$FROMDIR" ] || usage; fi
+    do_deploy "$COMP" "$VER" "$FROMDIR";;
+  rollback) do_rollback "$COMP";;
+  *) usage;;
+esac

@@ -1,0 +1,43 @@
+#!/bin/bash
+# Decides the release of a main commit (run by the release workflow of an app repository, after a push to main):
+#   next-version --repo OWNER/NAME --sha SHA        (in a full checkout with tags; needs `gh` and GH_TOKEN)
+# Rules (one place, tested in tests/test.sh):
+#   - the PR(s) behind the commit (the PR that was merged, plus every #N in the commit message) carry the labels:
+#       major | minor   -> bump; no label -> patch.   no-release -> no release.
+#   - a commit that only touches *.md / docs/ makes no release.
+#   - major needs the label security-approved on a PR that carries it; without it the run FAILS and no tag is created
+#     (add the label and re-run the workflow: the approval happens before the tag, never after it).
+#   - the commit already has a vX.Y.Z tag -> that version again (a re-run never makes a second tag).
+# Prints key=value lines (also to $GITHUB_OUTPUT): skip=true|false, version=X.Y.Z, bump=..., reason=...
+set -uo pipefail
+GH=${GH:-gh}
+REPO=""; SHA=""
+while [ $# -gt 0 ]; do case "$1" in --repo) REPO=${2:-}; shift 2;; --sha) SHA=${2:-}; shift 2;; *) echo "next-version: bad argument $1" >&2; exit 2;; esac; done
+[ -n "$REPO" ] && [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "usage: next-version --repo OWNER/NAME --sha SHA" >&2; exit 2; }
+out() { printf '%s\n' "$*"; [ -n "${GITHUB_OUTPUT:-}" ] && printf '%s\n' "$*" >>"$GITHUB_OUTPUT"; return 0; }
+skip() { out "skip=true"; out "version="; out "bump=none"; out "reason=$1"; exit 0; }
+
+TAGS=$(git tag --points-at "$SHA" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+if [ -n "$TAGS" ]; then out "skip=false"; out "version=${TAGS#v}"; out "bump=existing"; out "reason=commit already tagged $TAGS"; exit 0; fi
+
+FILES=$(git diff-tree --no-commit-id --name-only -r -m --first-parent "$SHA" 2>/dev/null || true)
+if [ -n "$FILES" ] && ! printf '%s\n' "$FILES" | grep -Evq '(^docs/|\.md$)'; then skip "docs-only change"; fi
+
+PRS=$( { "$GH" api "repos/$REPO/commits/$SHA/pulls" --jq '.[].number' 2>/dev/null; git log -1 --format=%B "$SHA" | grep -oE '#[0-9]+' | tr -d '#'; } | sort -un)
+BUMP=patch; APPROVED=no; MAJORPR=no
+for n in $PRS; do
+  L=$("$GH" api "repos/$REPO/issues/$n" --jq '[.labels[].name]|join(",")' 2>/dev/null || true)
+  case ",$L," in *,no-release,*) skip "label no-release on #$n";; esac
+  case ",$L," in *,major,*) BUMP=major; MAJORPR=yes;; esac
+  case ",$L," in *,minor,*) [ "$BUMP" = major ] || BUMP=minor;; esac
+  case ",$L," in *,security-approved,*) APPROVED=yes;; esac
+done
+if [ "$BUMP" = major ] && [ "$APPROVED" != yes ]; then
+  echo "next-version: major release without the label security-approved: no tag is created. Add the label to the PR and re-run this workflow." >&2
+  out "skip=true"; out "version="; out "bump=major"; out "reason=major needs security-approved"; exit 1
+fi
+LAST=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+LAST=${LAST#v}; LAST=${LAST:-0.0.0}
+IFS=. read -r MA MI PA <<<"$LAST"
+case "$BUMP" in major) MA=$((MA + 1)); MI=0; PA=0;; minor) MI=$((MI + 1)); PA=0;; *) PA=$((PA + 1));; esac
+out "skip=false"; out "version=$MA.$MI.$PA"; out "bump=$BUMP"; out "reason=last $LAST, PRs: $(echo $PRS | tr '\n' ' ')"

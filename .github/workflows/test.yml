@@ -1,0 +1,26 @@
+name: test
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Scripts + tests
+        run: |
+          set -euo pipefail
+          for f in bin/* host/*.sh tests/test.sh; do bash -n "$f"; done
+          bash tests/test.sh
+  macos:
+    runs-on: macos-latest        # the host runs the macOS system bash (3.2) and BSD tools
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
+        with:
+          persist-credentials: false
+      - run: /bin/bash tests/test.sh
