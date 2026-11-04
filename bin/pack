@@ -37,6 +37,8 @@ else
   mkdir "$T/t"
   (cd "$WEBDIR" && git ls-files -z | tr '\0' '\n' | grep -Ev "$EXCL" | sort >"$T/list" || true)
   [ -s "$T/list" ] || die "no files to pack in $WEBDIR"
+  grep -qx 'index.html' "$T/list" || die "no index.html in the web tree"
+  (cd "$WEBDIR" && git ls-files -s | grep -E '^(120000|160000) ' | head -1 | grep . >/dev/null) && die "web tree has symlinks or submodules"
   (cd "$WEBDIR" && tar -czf "$OUT/$ASSET.tar.gz" -T "$T/list")
 fi
 H=$(sha_of "$OUT/$ASSET.tar.gz")

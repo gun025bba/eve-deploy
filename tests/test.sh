@@ -60,6 +60,10 @@ check "sha256 file matches the tarball" "$(awk '{print $1}' "$G1/eve-gateway-1.0
 W1=$(mk_web 1.0.0); check "web tar excludes README.md and tests/" "$(tar -tzf "$W1/eve-web-1.0.0.tar.gz" | sort | tr '\n' ' ')" "index.html "
 if bash "$R/bin/pack" gateway --version 1.0 --commit x --gateway /nonexistent --out "$T/o" >/dev/null 2>&1; then bad "pack refuses a bad version"; else ok "pack refuses a bad version"; fi
 
+# web tree with a symlink / without index.html is refused
+mkdir -p "$T/sl" && ( cd "$T/sl" && git init -q . && echo h >index.html && ln -s /etc/passwd evil && git add -A && git -c user.email=t@t -c user.name=t commit -qm i )
+if bash "$R/bin/pack" web --version 1.0.0 --commit 0123456789abcdef0123456789abcdef01234567 --web-dir "$T/sl" --out "$T/slo" >/dev/null 2>&1; then bad "pack refuses a web tree with a symlink"; else ok "pack refuses a web tree with a symlink"; fi
+
 echo "== gateway deploy"
 $D deploy gateway 1.0.0 --from "$G1" >"$T/o1" 2>&1; check "first deploy exits 0" "$?" 0
 check "state says 1.0.0" "$(cat "$EVE_ROOT/state/gateway.version")" 1.0.0
@@ -94,6 +98,10 @@ if [ -f "$T/evil/eve-gateway-1.5.0-darwin-arm64.tar.gz" ]; then
   printf '{"component":"gateway","version":"1.5.0","commit":"x"}\n' >"$T/evil/manifest.json"
   $D deploy gateway 1.5.0 --from "$T/evil" >/dev/null 2>&1; check "tar with .. path refused" "$?" 1
 else ok "tar with .. path refused (tar cannot build the sample here: skipped)"; fi
+# a release containing a symlink is refused
+mkdir -p "$T/ln/in" && ( cd "$T/ln/in" && printf '#!/bin/sh\nexit 0\n' >gateway && chmod +x gateway && ln -s /etc/passwd eve-gw && tar -czf ../eve-gateway-1.5.1-darwin-arm64.tar.gz gateway eve-gw )
+H=$(sha_of "$T/ln/eve-gateway-1.5.1-darwin-arm64.tar.gz"); echo "$H  x" >"$T/ln/eve-gateway-1.5.1-darwin-arm64.tar.gz.sha256"; printf '{"component":"gateway","version":"1.5.1","commit":"x"}\n' >"$T/ln/manifest.json"
+$D deploy gateway 1.5.1 --from "$T/ln" >/dev/null 2>&1; check "tar with a symlink refused" "$?" 1
 # version endpoint contract (C4)
 export EVE_VERSION_URL=http://127.0.0.1:$PORT/version
 G6=$(mk_gw 1.6.0); $D deploy gateway 1.6.0 --from "$G6" >/dev/null 2>&1; check "deploy with a version endpoint" "$?" 0

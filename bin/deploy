@@ -92,6 +92,7 @@ verify_release() { # $1 component $2 version $3 dir $4 asset
   [[ "$want" =~ ^[0-9a-f]{64}$ ]] && [ "$want" = "$got" ] || return 1
   [ "$(json_get "$3/manifest.json" component)" = "$1" ] && [ "$(json_get "$3/manifest.json" version)" = "$2" ] || return 2
   if tar -tzf "$3/$4.tar.gz" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then return 3; fi
+  if tar -tvzf "$3/$4.tar.gz" | grep -Eq '^[lh]'; then return 3; fi      # no symlinks or hard links inside a release
   return 0
 }
 
