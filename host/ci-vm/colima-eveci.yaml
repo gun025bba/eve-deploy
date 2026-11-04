@@ -1,0 +1,31 @@
+# colima profile "eveci": Linux VM (Apple Virtualization.framework, no sudo) for CI containers only.
+# NO host mounts except one empty read-only directory (colima mounts the whole home directory when `mounts` is empty).
+cpu: 4
+memory: 14
+disk: 60
+arch: aarch64
+runtime: docker
+hostname: eveci
+autoActivate: false
+vmType: vz
+mountType: virtiofs
+rosetta: false
+binfmt: false
+nestedVirtualization: false
+network:
+  address: false
+  mode: shared
+sshConfig: false
+mounts:
+  - location: __EMPTY_DIR__
+    writable: false
+provision:
+  # Containers may reach the internet but not the Mac or its network: block private/link-local/tailnet ranges leaving the VM.
+  # (DNS is answered by dockerd itself, not forwarded through this chain.) Runs as root inside the VM at every boot.
+  - mode: system
+    script: |
+      #!/bin/sh
+      iptables -N DOCKER-USER 2>/dev/null || true
+      for r in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16; do
+        iptables -C DOCKER-USER -o eth0 -d $r -j DROP 2>/dev/null || iptables -I DOCKER-USER -o eth0 -d $r -j DROP
+      done
