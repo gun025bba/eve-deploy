@@ -23,10 +23,23 @@ if [ -n "$TAGS" ]; then out "skip=false"; out "version=${TAGS#v}"; out "bump=exi
 FILES=$(git diff-tree --no-commit-id --name-only -r -m --first-parent "$SHA" 2>/dev/null || true)
 if [ -n "$FILES" ] && ! printf '%s\n' "$FILES" | grep -Evq '(^docs/|\.md$)'; then skip "docs-only change"; fi
 
-PRS=$( { "$GH" api "repos/$REPO/commits/$SHA/pulls" --jq '.[].number' 2>/dev/null; git log -1 --format=%B "$SHA" | grep -oE '#[0-9]+' | tr -d '#'; } | sort -un)
+# Any PR number found (GitHub's commit->PR list, or "(#N)" in the squash message) must have readable labels: a silent miss would turn a major
+# into a patch. Only "404 Not Found" is ignored, for a number that belongs to another repository; 403, 5xx, network errors and jq errors stop the run.
+# commits/SHA/pulls can answer "[]" right after the merge, so the message numbers are as binding as the API list.
+APIPRS=$("$GH" api "repos/$REPO/commits/$SHA/pulls" --jq '.[].number') || { echo "next-version: cannot list the PRs of $SHA" >&2; out "skip=true"; out "version="; out "reason=cannot list PRs"; exit 1; }
+PRS=$( { printf '%s\n' "$APIPRS"; git log -1 --format=%B "$SHA" | grep -oE '#[0-9]+' | tr -d '#'; } | grep -E '^[0-9]+$' | sort -un)
 BUMP=patch; APPROVED=no; MAJORPR=no
+ERRF=$(mktemp); trap 'rm -f "$ERRF"' EXIT
 for n in $PRS; do
-  L=$("$GH" api "repos/$REPO/issues/$n" --jq '[.labels[].name]|join(",")' 2>/dev/null || true)
+  # pulls/N needs only pull-requests: read (the plan job has no issues: read, so issues/N answers 403 there); issues/N is the fallback
+  if L=$("$GH" api "repos/$REPO/pulls/$n" --jq '[.labels[].name]|join(",")' 2>"$ERRF"); then :
+  elif grep -q 'HTTP 404' "$ERRF"; then
+    echo "next-version: #$n is not a PR of $REPO (404): ignored" >&2; continue
+  elif L=$("$GH" api "repos/$REPO/issues/$n" --jq '[.labels[].name]|join(",")' 2>/dev/null); then :
+  else
+    echo "next-version: cannot read the labels of PR #$n: no tag is created" >&2; out "skip=true"; out "version="; out "reason=cannot read labels of #$n"; exit 1
+  fi
+  # no-release wins over every other label on any PR of the commit (an explicit "do not release" must not be outvoted by a major on another PR)
   case ",$L," in *,no-release,*) skip "label no-release on #$n";; esac
   case ",$L," in *,major,*) BUMP=major; MAJORPR=yes;; esac
   case ",$L," in *,minor,*) [ "$BUMP" = major ] || BUMP=minor;; esac
@@ -40,4 +53,5 @@ LAST=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | grep -E '^v[0-
 LAST=${LAST#v}; LAST=${LAST:-0.0.0}
 IFS=. read -r MA MI PA <<<"$LAST"
 case "$BUMP" in major) MA=$((MA + 1)); MI=0; PA=0;; minor) MI=$((MI + 1)); PA=0;; *) PA=$((PA + 1));; esac
-out "skip=false"; out "version=$MA.$MI.$PA"; out "bump=$BUMP"; out "reason=last $LAST, PRs: $(echo $PRS | tr '\n' ' ')"
+if [ -n "$PRS" ]; then PRTXT=$(echo $PRS); else PRTXT="no PR found"; fi   # one line: the value goes into GITHUB_OUTPUT
+out "skip=false"; out "version=$MA.$MI.$PA"; out "bump=$BUMP"; out "reason=last $LAST, PRs: $PRTXT"
