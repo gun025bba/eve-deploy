@@ -23,10 +23,20 @@ if [ -n "$TAGS" ]; then out "skip=false"; out "version=${TAGS#v}"; out "bump=exi
 FILES=$(git diff-tree --no-commit-id --name-only -r -m --first-parent "$SHA" 2>/dev/null || true)
 if [ -n "$FILES" ] && ! printf '%s\n' "$FILES" | grep -Evq '(^docs/|\.md$)'; then skip "docs-only change"; fi
 
-PRS=$( { "$GH" api "repos/$REPO/commits/$SHA/pulls" --jq '.[].number' 2>/dev/null; git log -1 --format=%B "$SHA" | grep -oE '#[0-9]+' | tr -d '#'; } | sort -un)
+# PRs GitHub itself links to the commit: their labels MUST be readable (fail closed, a silent miss would turn a major into a patch).
+APIPRS=$("$GH" api "repos/$REPO/commits/$SHA/pulls" --jq '.[].number') || { echo "next-version: cannot list the PRs of $SHA" >&2; out "skip=true"; out "version="; out "reason=cannot list PRs"; exit 1; }
+PRS=$( { printf '%s\n' "$APIPRS"; git log -1 --format=%B "$SHA" | grep -oE '#[0-9]+' | tr -d '#'; } | grep -E '^[0-9]+$' | sort -un)
 BUMP=patch; APPROVED=no; MAJORPR=no
 for n in $PRS; do
-  L=$("$GH" api "repos/$REPO/issues/$n" --jq '[.labels[].name]|join(",")' 2>/dev/null || true)
+  # pulls/N needs only pull-requests: read (the plan job has no issues: read, so issues/N answers 403 there); issues/N is the fallback
+  if L=$("$GH" api "repos/$REPO/pulls/$n" --jq '[.labels[].name]|join(",")' 2>/dev/null); then :
+  elif L=$("$GH" api "repos/$REPO/issues/$n" --jq '[.labels[].name]|join(",")' 2>/dev/null); then :
+  else
+    L=""
+    if printf '%s\n' "$APIPRS" | grep -qx "$n"; then
+      echo "next-version: cannot read the labels of PR #$n: no tag is created" >&2; out "skip=true"; out "version="; out "reason=cannot read labels of #$n"; exit 1
+    fi   # a number only mentioned in the commit message may belong to another repository: ignore it
+  fi
   case ",$L," in *,no-release,*) skip "label no-release on #$n";; esac
   case ",$L," in *,major,*) BUMP=major; MAJORPR=yes;; esac
   case ",$L," in *,minor,*) [ "$BUMP" = major ] || BUMP=minor;; esac
