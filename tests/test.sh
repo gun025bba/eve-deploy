@@ -237,6 +237,9 @@ export PRS=""; export LABELS_77="minor"; case "$(nvf a.txt 'squash of develop (#
 export PRS=10; export LABELS_10=""; ( cd "$N" && echo z >>a.txt && git add -A && git commit -q -m tagged && git tag v1.2.9 ); S=$(cd "$N" && git rev-parse HEAD)
 case "$(cd "$N" && bash "$R/bin/next-version" --repo o/r --sha "$S" 2>/dev/null | tr '\n' ' ')" in *"version=1.2.9"*"bump=existing"*) ok "already tagged commit -> same version";; *) bad "already tagged";; esac
 
+# every output value is one line (GITHUB_OUTPUT)
+export PRS="10 11"; export LABELS_10=""; export LABELS_11=""; OUTF=$T/ghout; : >"$OUTF"; ( cd "$N" && echo "$RANDOM" >>a.txt && git add -A && git commit -q -m "two (#10) (#11)" && GITHUB_OUTPUT="$OUTF" bash "$R/bin/next-version" --repo o/r --sha "$(git rev-parse HEAD)" >/dev/null 2>&1 ); check "GITHUB_OUTPUT: 4 single-line entries" "$(grep -c '^[a-z]*=' "$OUTF")/$(wc -l <"$OUTF" | tr -d ' ')" "4/4"
+unset LABELS_11
 # regression: the plan job token has no issues: read (issues/N -> 403): the labels must still be read through pulls/N
 export PRS=10; export ISSUES_403=1; export LABELS_10="major,security-approved"; case "$(nvf a.txt 'code change')" in *"version=2.0.0"*"bump=major"*"rc=0"*) ok "issues/N 403 -> labels still read via pulls/N (major + approved)";; *) bad "pulls/N path: $(nvf a.txt x)";; esac
 unset ISSUES_403

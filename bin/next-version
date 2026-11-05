@@ -53,4 +53,5 @@ LAST=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | grep -E '^v[0-
 LAST=${LAST#v}; LAST=${LAST:-0.0.0}
 IFS=. read -r MA MI PA <<<"$LAST"
 case "$BUMP" in major) MA=$((MA + 1)); MI=0; PA=0;; minor) MI=$((MI + 1)); PA=0;; *) PA=$((PA + 1));; esac
-out "skip=false"; out "version=$MA.$MI.$PA"; out "bump=$BUMP"; out "reason=last $LAST, PRs: ${PRS:+$(echo $PRS | tr '\n' ' ')}${PRS:-no PR found}"
+if [ -n "$PRS" ]; then PRTXT=$(echo $PRS); else PRTXT="no PR found"; fi   # one line: the value goes into GITHUB_OUTPUT
+out "skip=false"; out "version=$MA.$MI.$PA"; out "bump=$BUMP"; out "reason=last $LAST, PRs: $PRTXT"
