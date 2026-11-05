@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && echo "deb [arch=arm64 signed-by=/etc/apt/keyrings/githubcli.gpg] https://cli.github.com/packages stable main" >/etc/apt/sources.list.d/github-cli.list \
  && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /etc/apt/keyrings/pgdg.gpg \
  && echo "deb [signed-by=/etc/apt/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt noble-pgdg main" >/etc/apt/sources.list.d/pgdg.list \
- && apt-get update && apt-get install -y --no-install-recommends gh postgresql-17 \
+ && apt-get update && apt-get install -y --no-install-recommends gh postgresql-17 postgresql-17-pgvector \
  && systemctl disable postgresql 2>/dev/null; rm -rf /var/lib/apt/lists/*
 # Playwright browser + its system libraries (web tests; version = tests/requirements.txt of eve-web). The job's `playwright install chromium` is a
 # no-op when the version matches and downloads the other one into this (container-local, throwaway) directory when it does not.
@@ -25,6 +25,7 @@ RUN useradd -m -u 1001 -s /bin/bash runner \
  && curl -fsSL --retry 5 -o r.tgz "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-arm64-${RUNNER_VERSION}.tar.gz" \
  && echo "${RUNNER_SHA256}  r.tgz" | sha256sum -c - && tar -xzf r.tgz && rm r.tgz \
  && ./bin/installdependencies.sh && rm -rf /var/lib/apt/lists/*
+# postgresql-17-pgvector: the personal-memory migrations run CREATE EXTENSION vector against this cluster (production has the extension already)
 # the postgres cluster in scripts/ci-pg.sh is created per job under $RUNNER_TEMP by the runner user
 ENV CI_PG_BIN=/usr/lib/postgresql/17/bin
 COPY entrypoint.sh /usr/local/bin/eve-ci-entrypoint
