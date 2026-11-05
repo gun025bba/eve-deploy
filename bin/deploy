@@ -122,19 +122,72 @@ restore_gateway_files() { # put back what install_gateway_files staged (a failed
   local f; for f in gateway eve-gw; do [ -f "$STAGE_BIN/$f" ] && cp -p "$STAGE_BIN/$f" "$BIN/$f.new" && mv -f "$BIN/$f.new" "$BIN/$f"; done; return 0
 }
 commit_gateway_files() { rm -rf "$PREV_BIN"; mv "$STAGE_BIN" "$PREV_BIN"; }
-install_web_tree() { # $1 new tree dir (becomes $WEB); the old one becomes $PREV_WEB; the older previous waits in $PREV_WEB.old until success
-  mkdir -p "$EVE_ROOT/previous" || return 1
-  rm -rf "$PREV_WEB.old"; [ -d "$PREV_WEB" ] && mv "$PREV_WEB" "$PREV_WEB.old"
-  [ -d "$WEB" ] && { mv "$WEB" "$PREV_WEB" || return 1; }
-  mv "$1" "$WEB" || { [ -d "$PREV_WEB" ] && mv "$PREV_WEB" "$WEB"; [ -d "$PREV_WEB.old" ] && mv "$PREV_WEB.old" "$PREV_WEB"; return 1; }
+# The web tree is swapped IN PLACE: $WEB itself stays where it is and only its contents move. $EVE_ROOT is owned by root, so the
+# deploy user can not rename $WEB (that needs write access to its parent), but it owns $WEB and $EVE_ROOT/previous.
+# index.html and sw.js are the entry points: they leave first and come back last, so a client never meets a new page with old assets
+# (or a new service worker before its files). Every step that can fail has an undo that moves files back and never deletes live files.
+empty_dir() { [ -d "$1" ] && find "$1" -mindepth 1 -maxdepth 1 -exec rm -rf {} + ; }
+move_contents() { # $1 source dir, $2 destination dir (must not hold the same names), $3 first|last: where index.html + sw.js go; leaves what it could not move in $1
+  local e b k; mkdir -p "$2" || return 1
+  if [ "${3:-}" = first ]; then for k in index.html sw.js; do [ -e "$1/$k" ] && { [ ! -e "$2/$k" ] && mv "$1/$k" "$2/" || return 1; }; done; fi
+  for e in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+    [ -e "$e" ] || [ -L "$e" ] || continue; b=${e##*/}
+    if [ -n "${3:-}" ]; then case "$b" in index.html|sw.js) continue;; esac; fi
+    [ ! -e "$2/$b" ] || return 1
+    mv "$e" "$2/" || return 1
+  done
+  if [ "${3:-}" = last ]; then for k in index.html sw.js; do [ -e "$1/$k" ] && { [ ! -e "$2/$k" ] && mv "$1/$k" "$2/" || return 1; }; done; fi
+  return 0
+}
+web_hint() { # $1 what failed; $2.. the manual commands. Printed only when an automatic undo did not work too.
+  local what=$1; shift
+  log "MANUAL RECOVERY NEEDED: $what, and putting the files back failed too. Look at: ls -A $WEB $PREV_WEB $EVE_ROOT/previous/web.swap"
+  log "  The release that was live belongs in $WEB, the older one in $PREV_WEB (state/web.version says which is which). To put it back by hand:"
+  local c; for c in "$@"; do log "    $c"; done
+  log "  or redeploy the live release: bash bin/deploy deploy web <version> --from <dir with its tarball>"
+}
+install_web_tree() { # $1 new tree dir (its contents become $WEB); the old contents become $PREV_WEB; the older previous waits in $PREV_WEB.old until success
+  mkdir -p "$EVE_ROOT/previous" "$WEB" || return 1
+  rm -rf "$PREV_WEB.old"; [ -d "$PREV_WEB" ] && { mv "$PREV_WEB" "$PREV_WEB.old" || return 1; }
+  mkdir -p "$PREV_WEB" || return 1
+  if ! move_contents "$WEB" "$PREV_WEB" first; then
+    # step 1 failed: $WEB still holds the old files that did not move; only put the moved ones back (nothing is deleted)
+    move_contents "$PREV_WEB" "$WEB" last || web_hint "installing web: moving the old files aside failed" "mv $PREV_WEB/* $PREV_WEB/.[!.]* $WEB/"
+    rmdir "$PREV_WEB" 2>/dev/null; [ -d "$PREV_WEB.old" ] && mv "$PREV_WEB.old" "$PREV_WEB"; return 1
+  fi
+  if ! move_contents "$1" "$WEB" last; then
+    # step 2 failed: $WEB holds only (part of) the new files, which are disposable: put them back into $1, or delete them, then restore the old files
+    move_contents "$WEB" "$1" || empty_dir "$WEB"
+    move_contents "$PREV_WEB" "$WEB" last || web_hint "installing web: moving the new files in failed" "mv $WEB/* $WEB/.[!.]* $1/   # or delete them" "mv $PREV_WEB/* $PREV_WEB/.[!.]* $WEB/"
+    rmdir "$PREV_WEB" 2>/dev/null; [ -d "$PREV_WEB.old" ] && mv "$PREV_WEB.old" "$PREV_WEB"; return 1
+  fi
   chmod -R go+rX "$WEB" 2>/dev/null; return 0
 }
 commit_web_tree() { rm -rf "$PREV_WEB.old"; }
-restore_web_tree() {
-  rm -rf "$WEB.failed"; [ -d "$WEB" ] && mv "$WEB" "$WEB.failed"
-  [ -d "$PREV_WEB" ] && mv "$PREV_WEB" "$WEB"
+restore_web_tree() { # the new tree failed its health check
+  empty_dir "$WEB"
+  move_contents "$PREV_WEB" "$WEB" last && rmdir "$PREV_WEB" 2>/dev/null || web_hint "restoring the old web tree failed" "mv $PREV_WEB/* $PREV_WEB/.[!.]* $WEB/"
   [ -d "$PREV_WEB.old" ] && mv "$PREV_WEB.old" "$PREV_WEB"
-  rm -rf "$WEB.failed"; return 0
+  return 0
+}
+rollback_web_tree() { # swap the contents of $WEB and $PREV_WEB through $keep. 0 = swapped; 1 = failed at some step, original state restored; 2 = failed and not restored (hint printed)
+  local keep="$EVE_ROOT/previous/web.swap" step=1 hint
+  rm -rf "$keep"; mkdir -p "$keep" || return 1
+  move_contents "$WEB" "$keep" first || step=-1
+  if [ $step = 1 ]; then step=2; move_contents "$PREV_WEB" "$WEB" last || step=-2; fi
+  if [ $step = 2 ]; then step=3; move_contents "$keep" "$PREV_WEB" last || step=-3; fi
+  if [ $step = 3 ]; then rmdir "$keep" 2>/dev/null; return 0; fi
+  step=$((-step))
+  log "rollback web: step $step of 3 failed ($(case $step in 1) echo "live files -> $keep";; 2) echo "older files -> $WEB";; 3) echo "kept files -> $PREV_WEB";; esac)): undoing"
+  case $step in
+    1) move_contents "$keep" "$WEB" last && rmdir "$keep" && return 1
+       hint="mv $keep/* $keep/.[!.]* $WEB/";;
+    2) move_contents "$WEB" "$PREV_WEB" first && move_contents "$keep" "$WEB" last && rmdir "$keep" && return 1
+       hint="mv $WEB/* $WEB/.[!.]* $PREV_WEB/ && mv $keep/* $keep/.[!.]* $WEB/";;
+    3) move_contents "$PREV_WEB" "$keep" first && move_contents "$WEB" "$PREV_WEB" first && move_contents "$keep" "$WEB" last && rmdir "$keep" && return 1
+       hint="mv $PREV_WEB/* $PREV_WEB/.[!.]* $keep/ && mv $WEB/* $WEB/.[!.]* $PREV_WEB/ && mv $keep/* $keep/.[!.]* $WEB/";;
+  esac
+  web_hint "rollback web stopped at step $step of 3" "$hint"; return 2
 }
 
 # ----- commands -----
@@ -200,7 +253,8 @@ do_rollback() { # $1 component
     rm -rf "$tmp"
   else
     [ -d "$PREV_WEB" ] || die "no previous web tree is kept"
-    local keep="$EVE_ROOT/previous/web.swap"; rm -rf "$keep"; mv "$WEB" "$keep" && mv "$PREV_WEB" "$WEB" && mv "$keep" "$PREV_WEB" || die "cannot swap the web trees"
+    rollback_web_tree; rc=$?
+    case $rc in 1) die "web rollback failed while moving files; the original web trees were restored";; 2) die "web rollback failed while moving files and the original state could NOT be restored: see MANUAL RECOVERY in $ST/deploy.log";; esac
     if wait_healthy web "$TO_V"; then echo "$TO_V" >"$ST/web.version"; echo "$FROM_V" >"$ST/web.previous"; STATUS=success; HEALTH=ok; else HEALTH=unhealthy; STATUS=failed; fi
   fi
   write_result; [ "$STATUS" = success ]

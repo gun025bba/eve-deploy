@@ -128,6 +128,7 @@ grep -q 'GW_DB_AUTO_MIGRATE' "$R/host/setup.sh" && ok "host setup sets GW_DB_AUT
 mkdir "$EVE_ROOT/state/lock"; $D deploy gateway 1.7.0 --from "$G6" >/dev/null 2>&1; check "second deploy while one runs is refused" "$?" 1; rmdir "$EVE_ROOT/state/lock"
 
 echo "== web deploy"
+mkdir -p "$EVE_ROOT/previous"; chmod 555 "$EVE_ROOT"   # like production: the deploy user can not rename entries of $EVE_ROOT itself
 $D deploy web 1.0.0 --from "$W1" >/dev/null 2>&1; check "web first deploy" "$?" 0
 check "web tree is live" "$(cat "$EVE_ROOT/web/index.html")" "<html>1.0.0 good</html>"
 W2=$(mk_web 1.1.0); $D deploy web 1.1.0 --from "$W2" >/dev/null 2>&1; check "web update" "$?" 0
@@ -137,6 +138,75 @@ check "bad web release: old tree restored" "$(cat "$EVE_ROOT/web/index.html")" "
 check "bad web release: status" "$(res status)" rolled-back
 $D rollback web >/dev/null 2>&1; check "web rollback" "$?" 0
 check "web rollback: tree" "$(cat "$EVE_ROOT/web/index.html")" "<html>1.0.0 good</html>"
+
+echo "== web deploy: failing moves (a mv shim fails one chosen move; EVE_ROOT stays read-only)"
+mkdir -p "$T/shim"; cat >"$T/shim/mv" <<'SHIM'
+#!/bin/bash
+args=(); for a in "$@"; do case "$a" in -*) ;; *) args+=("$a");; esac; done
+dst=${args[${#args[@]}-1]}
+for s in "${args[@]:0:${#args[@]}-1}"; do
+  [ -z "${MV_LOG:-}" ] || echo "$s $dst" >>"$MV_LOG"
+  case "$s" in $MV_FAIL_SRC) case "$dst" in $MV_FAIL_DST)
+    if [ -n "${MV_FAIL_ALWAYS:-}" ] || [ ! -e "$MV_FAIL_MARK" ]; then : >"$MV_FAIL_MARK"; echo "mv: injected failure" >&2; exit 1; fi;; esac;; esac
+done
+exec /bin/mv "$@"
+SHIM
+chmod +x "$T/shim/mv"
+mk_webx() { # version: index.html, sw.js, app.js, zz.txt, a dot file and a sub directory
+  local d=$T/relx-web-$1; mkdir -p "$d/repo/assets"; ( cd "$d/repo" && git init -q . && printf '<html>%s good</html>\n' "$1" >index.html && echo "sw $1" >sw.js && echo "app $1" >app.js && echo "zz $1" >zz.txt && echo "hid $1" >.hid && echo "css $1" >assets/a.css && git add -A && git -c user.email=t@t -c user.name=t commit -qm i )
+  bash "$R/bin/pack" web --version "$1" --commit 0123456789abcdef0123456789abcdef01234567 --web-dir "$d/repo" --out "$d/out" >/dev/null && echo "$d/out"
+}
+snap() { ( cd "$1" 2>/dev/null && find . -type f | sort | while read -r f; do echo "$f $(sha_of "$f")"; done ) | tr '\n' ' '; }
+reset_web() { find "$EVE_ROOT/web" -mindepth 1 -delete; rm -rf "$EVE_ROOT"/previous/web "$EVE_ROOT"/previous/web.old "$EVE_ROOT"/previous/web.swap "$EVE_ROOT/state/web.version" "$EVE_ROOT/state/web.previous"; }
+fail_mv() { # src-glob dst-glob always -- command...   fails the first (or every, if always is set) matching mv
+  local s=$1 d=$2 al=$3; shift 3; rm -f "$T/mvmark"
+  PATH="$T/shim:$PATH" MV_FAIL_SRC="$s" MV_FAIL_DST="$d" MV_FAIL_MARK="$T/mvmark" MV_FAIL_ALWAYS="$al" "$@"
+}
+WX1=$(mk_webx 2.0.0); WX2=$(mk_webx 2.1.0); E=$EVE_ROOT
+two_releases() { reset_web; $D deploy web 2.0.0 --from "$WX1" >/dev/null 2>&1; $D deploy web 2.1.0 --from "$WX2" >/dev/null 2>&1; }
+
+reset_web; $D deploy web 2.0.0 --from "$WX1" >/dev/null 2>&1; BEFORE=$(snap "$E/web"); BP=$(snap "$E/previous/web")
+check "setup: the 2.0.0 tree has 6 files incl. the dot file" "$(echo "$BEFORE" | grep -o ' ' | wc -l | tr -d ' ')" 12
+fail_mv "$E/web/zz.txt" "$E/previous/web/" "" bash "$R/bin/deploy" deploy web 2.1.0 --from "$WX2" >/dev/null 2>&1; check "install, old files cannot be moved aside: exits 1" "$?" 1
+check "install step 1 failed: the injected failure was hit" "$([ -e "$T/mvmark" ] && echo yes)" yes
+check "install step 1 failed: every old live file is still there (none deleted)" "$(snap "$E/web")" "$BEFORE"
+check "install step 1 failed: previous/web is as before" "$(snap "$E/previous/web")" "$BP"
+check "install step 1 failed: version unchanged" "$(cat "$E/state/web.version")" 2.0.0
+
+reset_web; $D deploy web 2.0.0 --from "$WX1" >/dev/null 2>&1; BEFORE=$(snap "$E/web"); BP=$(snap "$E/previous/web")
+fail_mv "$E/state/work.*/new/zz.txt" "$E/web/" "" bash "$R/bin/deploy" deploy web 2.1.0 --from "$WX2" >/dev/null 2>&1; check "install, new files cannot be moved in: exits 1" "$?" 1
+check "install step 2 failed: the injected failure was hit" "$([ -e "$T/mvmark" ] && echo yes)" yes
+check "install step 2 failed: old live files are back, no new file is mixed in" "$(snap "$E/web")" "$BEFORE"
+check "install step 2 failed: previous/web is as before" "$(snap "$E/previous/web")" "$BP"
+check "install step 2 failed: no previous/web.old left" "$([ -e "$E/previous/web.old" ] && echo yes || echo no)" no
+check "install step 2 failed: version unchanged" "$(cat "$E/state/web.version")" 2.0.0
+
+two_releases; LIVE=$(snap "$E/web"); PREVS=$(snap "$E/previous/web")
+check "setup: previous holds 2.0.0" "$(cat "$E/previous/web/index.html")" "<html>2.0.0 good</html>"
+fail_mv "$E/web/zz.txt" "$E/previous/web.swap/" "" bash "$R/bin/deploy" rollback web >/dev/null 2>&1; check "rollback step 1 fails: exits 1" "$?" 1
+check "rollback step 1: injected failure was hit" "$([ -e "$T/mvmark" ] && echo yes)" yes
+check "rollback step 1: live tree restored" "$(snap "$E/web")" "$LIVE"; check "rollback step 1: previous tree restored" "$(snap "$E/previous/web")" "$PREVS"
+check "rollback step 1: no web.swap left" "$([ -e "$E/previous/web.swap" ] && echo yes || echo no)" no
+check "rollback step 1: version unchanged" "$(cat "$E/state/web.version")" 2.1.0
+fail_mv "$E/previous/web/zz.txt" "$E/web/" "" bash "$R/bin/deploy" rollback web >/dev/null 2>&1; check "rollback step 2 fails: exits 1" "$?" 1
+check "rollback step 2: injected failure was hit" "$([ -e "$T/mvmark" ] && echo yes)" yes
+check "rollback step 2: live tree restored" "$(snap "$E/web")" "$LIVE"; check "rollback step 2: previous tree restored" "$(snap "$E/previous/web")" "$PREVS"
+check "rollback step 2: no web.swap left" "$([ -e "$E/previous/web.swap" ] && echo yes || echo no)" no
+fail_mv "$E/previous/web.swap/zz.txt" "$E/previous/web/" "" bash "$R/bin/deploy" rollback web >/dev/null 2>&1; check "rollback step 3 fails: exits 1" "$?" 1
+check "rollback step 3: injected failure was hit" "$([ -e "$T/mvmark" ] && echo yes)" yes
+check "rollback step 3: live tree restored" "$(snap "$E/web")" "$LIVE"; check "rollback step 3: previous tree restored" "$(snap "$E/previous/web")" "$PREVS"
+check "rollback step 3: no web.swap left" "$([ -e "$E/previous/web.swap" ] && echo yes || echo no)" no
+check "rollback step 3: version unchanged" "$(cat "$E/state/web.version")" 2.1.0
+OUT=$(fail_mv "$E/previous/web.swap/zz.txt" "*" 1 bash "$R/bin/deploy" rollback web 2>&1); check "rollback that cannot be undone: exits 1" "$?" 1
+check "unrecoverable rollback prints the failed step" "$(echo "$OUT" | grep -c 'rollback web stopped at step 3 of 3')" 1
+check "unrecoverable rollback prints the manual recovery commands" "$(echo "$OUT" | grep -c 'MANUAL RECOVERY NEEDED')" 1
+check "unrecoverable rollback: the manual command is in the log" "$(grep -c 'mv .*previous/web/\* .*web.swap/' "$E/state/deploy.log")" 1
+
+two_releases; : >"$T/mvlog"; PATH="$T/shim:$PATH" MV_LOG="$T/mvlog" MV_FAIL_SRC=none MV_FAIL_DST=none bash "$R/bin/deploy" deploy web 2.2.0 --from "$(mk_webx 2.2.0)" >/dev/null 2>&1
+INS=$(grep " $E/web/\$" "$T/mvlog" | awk '{n=split($1,a,"/"); print a[n]}' | tail -2 | tr '\n' ' ')
+check "index.html and sw.js leave first" "$(grep " $E/previous/web/\$" "$T/mvlog" | awk '{n=split($1,a,"/"); print a[n]}' | head -2 | tr '\n' ' ')" "index.html sw.js "
+check "index.html then sw.js come back last" "$INS" "index.html sw.js "
+chmod 755 "$EVE_ROOT"
 check "no sudo anywhere in the scripts" "$(cat "$R"/bin/* | sed 's/#.*//' | grep -c '\bsudo\b')" 0
 
 echo "== next-version"
