@@ -128,6 +128,7 @@ grep -q 'GW_DB_AUTO_MIGRATE' "$R/host/setup.sh" && ok "host setup sets GW_DB_AUT
 mkdir "$EVE_ROOT/state/lock"; $D deploy gateway 1.7.0 --from "$G6" >/dev/null 2>&1; check "second deploy while one runs is refused" "$?" 1; rmdir "$EVE_ROOT/state/lock"
 
 echo "== web deploy"
+mkdir -p "$EVE_ROOT/previous"; chmod 555 "$EVE_ROOT"   # like production: the deploy user can not rename entries of $EVE_ROOT itself
 $D deploy web 1.0.0 --from "$W1" >/dev/null 2>&1; check "web first deploy" "$?" 0
 check "web tree is live" "$(cat "$EVE_ROOT/web/index.html")" "<html>1.0.0 good</html>"
 W2=$(mk_web 1.1.0); $D deploy web 1.1.0 --from "$W2" >/dev/null 2>&1; check "web update" "$?" 0
@@ -137,6 +138,7 @@ check "bad web release: old tree restored" "$(cat "$EVE_ROOT/web/index.html")" "
 check "bad web release: status" "$(res status)" rolled-back
 $D rollback web >/dev/null 2>&1; check "web rollback" "$?" 0
 check "web rollback: tree" "$(cat "$EVE_ROOT/web/index.html")" "<html>1.0.0 good</html>"
+chmod 755 "$EVE_ROOT"
 check "no sudo anywhere in the scripts" "$(cat "$R"/bin/* | sed 's/#.*//' | grep -c '\bsudo\b')" 0
 
 echo "== next-version"

@@ -122,19 +122,25 @@ restore_gateway_files() { # put back what install_gateway_files staged (a failed
   local f; for f in gateway eve-gw; do [ -f "$STAGE_BIN/$f" ] && cp -p "$STAGE_BIN/$f" "$BIN/$f.new" && mv -f "$BIN/$f.new" "$BIN/$f"; done; return 0
 }
 commit_gateway_files() { rm -rf "$PREV_BIN"; mv "$STAGE_BIN" "$PREV_BIN"; }
-install_web_tree() { # $1 new tree dir (becomes $WEB); the old one becomes $PREV_WEB; the older previous waits in $PREV_WEB.old until success
-  mkdir -p "$EVE_ROOT/previous" || return 1
-  rm -rf "$PREV_WEB.old"; [ -d "$PREV_WEB" ] && mv "$PREV_WEB" "$PREV_WEB.old"
-  [ -d "$WEB" ] && { mv "$WEB" "$PREV_WEB" || return 1; }
-  mv "$1" "$WEB" || { [ -d "$PREV_WEB" ] && mv "$PREV_WEB" "$WEB"; [ -d "$PREV_WEB.old" ] && mv "$PREV_WEB.old" "$PREV_WEB"; return 1; }
-  chmod -R go+rX "$WEB" 2>/dev/null; return 0
+# The web tree is swapped IN PLACE: $WEB itself stays where it is and only its contents move. $EVE_ROOT is owned by root, so the
+# deploy user can not rename $WEB (that needs write access to its parent), but it owns $WEB and $EVE_ROOT/previous.
+empty_dir() { [ -d "$1" ] && find "$1" -mindepth 1 -maxdepth 1 -exec rm -rf {} + ; }
+move_contents() { # $1 source dir, $2 destination dir (must be empty): move every entry (dot files too), leave $1 empty
+  mkdir -p "$2" && find "$1" -mindepth 1 -maxdepth 1 -exec mv {} "$2"/ \; && [ -z "$(find "$1" -mindepth 1 -maxdepth 1 2>/dev/null | head -n 1)" ]
+}
+install_web_tree() { # $1 new tree dir (its contents become $WEB); the old contents become $PREV_WEB; the older previous waits in $PREV_WEB.old until success
+  mkdir -p "$EVE_ROOT/previous" "$WEB" || return 1
+  rm -rf "$PREV_WEB.old"; [ -d "$PREV_WEB" ] && { mv "$PREV_WEB" "$PREV_WEB.old" || return 1; }
+  mkdir -p "$PREV_WEB" || return 1
+  if move_contents "$WEB" "$PREV_WEB" && move_contents "$1" "$WEB"; then chmod -R go+rX "$WEB" 2>/dev/null; return 0; fi
+  empty_dir "$WEB"; move_contents "$PREV_WEB" "$WEB"; rmdir "$PREV_WEB" 2>/dev/null
+  [ -d "$PREV_WEB.old" ] && mv "$PREV_WEB.old" "$PREV_WEB"; return 1
 }
 commit_web_tree() { rm -rf "$PREV_WEB.old"; }
 restore_web_tree() {
-  rm -rf "$WEB.failed"; [ -d "$WEB" ] && mv "$WEB" "$WEB.failed"
-  [ -d "$PREV_WEB" ] && mv "$PREV_WEB" "$WEB"
+  empty_dir "$WEB"; move_contents "$PREV_WEB" "$WEB" && rmdir "$PREV_WEB" 2>/dev/null
   [ -d "$PREV_WEB.old" ] && mv "$PREV_WEB.old" "$PREV_WEB"
-  rm -rf "$WEB.failed"; return 0
+  return 0
 }
 
 # ----- commands -----
@@ -200,7 +206,7 @@ do_rollback() { # $1 component
     rm -rf "$tmp"
   else
     [ -d "$PREV_WEB" ] || die "no previous web tree is kept"
-    local keep="$EVE_ROOT/previous/web.swap"; rm -rf "$keep"; mv "$WEB" "$keep" && mv "$PREV_WEB" "$WEB" && mv "$keep" "$PREV_WEB" || die "cannot swap the web trees"
+    local keep="$EVE_ROOT/previous/web.swap"; rm -rf "$keep"; mkdir -p "$keep" && move_contents "$WEB" "$keep" && move_contents "$PREV_WEB" "$WEB" && move_contents "$keep" "$PREV_WEB" || die "cannot swap the web trees"; rmdir "$keep" 2>/dev/null
     if wait_healthy web "$TO_V"; then echo "$TO_V" >"$ST/web.version"; echo "$FROM_V" >"$ST/web.previous"; STATUS=success; HEALTH=ok; else HEALTH=unhealthy; STATUS=failed; fi
   fi
   write_result; [ "$STATUS" = success ]
