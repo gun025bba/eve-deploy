@@ -214,12 +214,13 @@ N=$T/nv; mkdir -p "$N" && cd "$N" && git init -q . && git config user.email t@t 
 mkdir docs && echo a >a.txt && echo d >docs/d.md && git add -A && git commit -qm base && git tag v1.2.3
 cat >"$T/gh" <<'SH'
 #!/bin/bash
-# fake gh: "api repos/R/commits/SHA/pulls --jq ..." -> $PRS ; "api repos/R/pulls/N" -> labels of PR N from $LABELS_<N> ;
-# "api repos/R/issues/N" -> same unless ISSUES_403=1 (the plan job token cannot read issues) ; READ_FAIL=1 -> both fail
+# fake gh: "api repos/R/commits/SHA/pulls --jq ..." -> $PRS (LIST_FAIL=1 -> fails) ; "api repos/R/pulls/N" -> labels of PR N from $LABELS_<N>, unset -> 404 ;
+# "api repos/R/issues/N" -> same unless ISSUES_403=1 (the plan job token cannot read issues) ; PULLS_403=1 / READ_FAIL=1 -> 403 like the real gh
+fail403() { echo "gh: Resource not accessible by integration (HTTP 403)" >&2; exit 1; }
 case "$2" in
-  */commits/*/pulls) for n in $PRS; do echo "$n"; done;;
-  */pulls/*) [ "${READ_FAIL:-}" = 1 ] || [ "${PULLS_403:-}" = 1 ] && exit 1; n=${2##*/}; v="LABELS_$n"; [ -n "${!v+x}" ] || exit 1; echo "${!v}";;
-  */issues/*) [ "${READ_FAIL:-}" = 1 ] || [ "${ISSUES_403:-}" = 1 ] && exit 1; n=${2##*/}; v="LABELS_$n"; [ -n "${!v+x}" ] || exit 1; echo "${!v}";;
+  */commits/*/pulls) [ "${LIST_FAIL:-}" = 1 ] && fail403; for n in $PRS; do echo "$n"; done;;
+  */pulls/*) { [ "${READ_FAIL:-}" = 1 ] || [ "${PULLS_403:-}" = 1 ]; } && fail403; n=${2##*/}; v="LABELS_$n"; [ -n "${!v+x}" ] || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }; echo "${!v}";;
+  */issues/*) { [ "${READ_FAIL:-}" = 1 ] || [ "${ISSUES_403:-}" = 1 ]; } && fail403; n=${2##*/}; v="LABELS_$n"; [ -n "${!v+x}" ] || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }; echo "${!v}";;
 esac
 SH
 chmod +x "$T/gh"; export GH="$T/gh"
@@ -237,12 +238,17 @@ export PRS=10; export LABELS_10=""; ( cd "$N" && echo z >>a.txt && git add -A &&
 case "$(cd "$N" && bash "$R/bin/next-version" --repo o/r --sha "$S" 2>/dev/null | tr '\n' ' ')" in *"version=1.2.9"*"bump=existing"*) ok "already tagged commit -> same version";; *) bad "already tagged";; esac
 
 # regression: the plan job token has no issues: read (issues/N -> 403): the labels must still be read through pulls/N
-export PRS=10; export ISSUES_403=1; export LABELS_10="major,security-approved"; case "$(nvf a.txt 'code change')" in *"version=2.0.0"*"rc=0"*) ok "issues/N 403 -> labels still read via pulls/N (major + approved)";; *) bad "pulls/N path: $(nvf a.txt x)";; esac
+export PRS=10; export ISSUES_403=1; export LABELS_10="major,security-approved"; case "$(nvf a.txt 'code change')" in *"version=2.0.0"*"bump=major"*"rc=0"*) ok "issues/N 403 -> labels still read via pulls/N (major + approved)";; *) bad "pulls/N path: $(nvf a.txt x)";; esac
 unset ISSUES_403
-export PRS=10; export PULLS_403=1; export LABELS_10="minor"; case "$(nvf a.txt 'code change')" in *"version=1."*"rc=0"*) ok "pulls/N unreadable -> falls back to issues/N";; *) bad "issues fallback";; esac
+export PRS=10; export PULLS_403=1; export LABELS_10="minor"; case "$(nvf a.txt 'code change')" in *"bump=minor"*"rc=0"*) ok "pulls/N 403 -> falls back to issues/N (minor bump read)";; *) bad "issues fallback: $(nvf a.txt x)";; esac
 unset PULLS_403
 export PRS=10; export READ_FAIL=1; export LABELS_10="major,security-approved"; case "$(nvf a.txt 'code change')" in *"skip=true"*"rc=1"*) ok "labels of a linked PR unreadable -> fails closed, no tag";; *) bad "fail closed: $(nvf a.txt x)";; esac
+export PRS=""; export LABELS_10="major,security-approved"; case "$(nvf a.txt 'squash (#10)')" in *"skip=true"*"rc=1"*) ok "PR list empty, (#10) in the message, label read fails -> fails closed";; *) bad "message PR unreadable: $(nvf a.txt x)";; esac
 unset READ_FAIL
-export PRS=""; case "$(nvf a.txt 'refs another repo (#9999)')" in *"rc=0"*) ok "number only in the commit message and unreadable -> ignored";; *) bad "foreign number";; esac
+export PRS=10; export LIST_FAIL=1; case "$(nvf a.txt 'code change')" in *"skip=true"*"rc=1"*) ok "commits/SHA/pulls call fails -> fails closed";; *) bad "list fail: $(nvf a.txt x)";; esac
+unset LIST_FAIL
+export PRS=""; case "$(nvf a.txt 'refs another repo (#9999)')" in *"bump=patch"*"rc=0"*) ok "number only in the message and 404 -> ignored";; *) bad "foreign number: $(nvf a.txt x)";; esac
+export PRS=""; case "$(nvf a.txt 'direct push without a number')" in *"no PR found"*"rc=0"*) ok "no PR at all -> patch, reason says so";; *) bad "no PR reason: $(nvf a.txt x)";; esac
+export PRS="10 11"; export LABELS_10="major,security-approved"; export LABELS_11="no-release"; case "$(nvf a.txt 'two PRs')" in *"skip=true"*"no-release"*"rc=0"*) ok "no-release on one PR wins over major on another";; *) bad "no-release priority: $(nvf a.txt x)";; esac
 
 echo; echo "passed: $PASS  failed: $FAILN"; [ "$FAILN" = 0 ]
