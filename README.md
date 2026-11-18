@@ -57,5 +57,6 @@ The server is moving to a single login-user account (LaunchAgent); the actual cu
 - The socket directory must be mode `0700`, owned by the deploy user, and not a symlink. The socket file itself is mode `0600`. eve-deploy refuses anything else.
 - Health, `/_deploy/version`, and automatic rollback belong to eve-supervisor. `result.json` keeps the old summary: `success`, `unchanged`, `rolled-back` (`health` `restored` or `restore-failed`), or `failed`.
 - `deploy rollback gateway` sends `{"command":"rollback","child":"<name>"}`. Web deploys still swap files and poll `EVE_UI_URL`.
+- State files live in `EVE_STATE_DIR` (default `$EVE_ROOT/state`). When the gateway version file is empty, deploy uses the supervisor's current version as the previous one. Rollback follows the supervisor's previous version when that differs from the state file. If the supervisor status read fails, deploy keeps the state file and continues.
 - The gateway migrates its own database at start (`GW_DB_AUTO_MIGRATE=true` in `deploy/launchd-go/gateway.plist.template` for installs that still use that template). The deploy account has no database credentials; a rollback is the previous binary (migrations are forward-only and expand-only).
 - `manifest.json` is optional: if the release has one, component and version must match.
