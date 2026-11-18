@@ -56,7 +56,7 @@ verify() {
   echo "- port 53 (TCP+UDP) must not be bound beyond loopback:"
   lsof -nP -iTCP:53 -iUDP:53 || true
   if lsof -nP -iTCP:53 -iUDP:53 2>/dev/null | awk 'NR>1{print $9}' | grep -vE '^(127\.0\.0\.1|\[::1\]):' | grep -q .; then echo "FAIL: port 53 bound beyond loopback"; exit 1; fi
-  echo "- all non-loopback listeners (any process; own-user only without sudo):"
+  echo "- all non-loopback listeners (any process, this user only):"
   local cur; cur=$(nonloopback_listeners)
   echo "${cur:-  (none)}" | sed 's/^/  /'
   local extra; extra=$(comm -23 <(echo "$cur" | awk 'NF{print $1}' | sort -u) <(printf '%s\n' $LISTEN_ALLOW | sort -u))

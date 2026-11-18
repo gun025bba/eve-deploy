@@ -1,9 +1,10 @@
 #!/bin/bash
 # Builds the release files of one component (run by the app repositories' release workflows):
-#   pack gateway --version X.Y.Z --commit SHA --gateway FILE [--eve-gw FILE] --out DIR
+#   pack gateway --version X.Y.Z --commit SHA --eve-gw FILE --eve-service FILE --eve-supervisor FILE --eve-admin FILE --out DIR
 #   pack web     --version X.Y.Z --commit SHA --web-dir DIR [--exclude ERE] --out DIR   (packs the files git tracks in DIR)
 # Output in DIR: <asset>.tar.gz, <asset>.tar.gz.sha256 and manifest.json (component, version, commit, built_at).
-#   gateway asset = eve-gateway-X.Y.Z-darwin-arm64     web asset = eve-web-X.Y.Z
+#   gateway asset = eve-gateway-X.Y.Z-darwin-arm64     (flat tar: eve-gw, eve-service, eve-supervisor, eve-admin)
+#   web asset = eve-web-X.Y.Z
 # No signing: sha256 only (the deploy step checks it against the download; it catches transfer errors).
 set -euo pipefail
 export LC_ALL=C COPYFILE_DISABLE=1
@@ -11,10 +12,12 @@ die() { echo "pack: $*" >&2; exit 1; }
 sha_of() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
 [ $# -ge 1 ] || die "usage: pack gateway|web --version V --commit SHA ..."
 KIND=$1; shift
-VER=""; SHA=""; GW=""; EG=""; WEBDIR=""; OUT=""; EXCL='^(\.github/|tests/|review-shots/|README\.md$|AGENTS\.md$|\.gitignore$|\.gitattributes$)'
+VER=""; SHA=""; EGW=""; ESVC=""; ESUP=""; EADM=""; WEBDIR=""; OUT=""; EXCL='^(\.github/|tests/|review-shots/|README\.md$|AGENTS\.md$|\.gitignore$|\.gitattributes$)'
 while [ $# -gt 0 ]; do
   case "$1" in
-    --version) VER=${2:-}; shift 2;; --commit) SHA=${2:-}; shift 2;; --gateway) GW=${2:-}; shift 2;; --eve-gw) EG=${2:-}; shift 2;;
+    --version) VER=${2:-}; shift 2;; --commit) SHA=${2:-}; shift 2;;
+    --eve-gw) EGW=${2:-}; shift 2;; --eve-service) ESVC=${2:-}; shift 2;;
+    --eve-supervisor) ESUP=${2:-}; shift 2;; --eve-admin) EADM=${2:-}; shift 2;;
     --web-dir) WEBDIR=${2:-}; shift 2;; --exclude) EXCL=${2:-}; shift 2;; --out) OUT=${2:-}; shift 2;;
     *) die "unknown argument: $1";;
   esac
@@ -27,9 +30,10 @@ mkdir -p "$OUT"; OUT=$(cd "$OUT" && pwd -P)
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 if [ "$KIND" = gateway ]; then
   ASSET="eve-gateway-$VER-darwin-arm64"
-  [ -f "$GW" ] || die "--gateway FILE is required"
-  mkdir "$T/t"; cp "$GW" "$T/t/gateway"; chmod 755 "$T/t/gateway"
-  if [ -n "$EG" ]; then [ -f "$EG" ] || die "--eve-gw file not found"; cp "$EG" "$T/t/eve-gw"; chmod 755 "$T/t/eve-gw"; fi
+  [ -f "$EGW" ] && [ -f "$ESVC" ] && [ -f "$ESUP" ] && [ -f "$EADM" ] || die "--eve-gw, --eve-service, --eve-supervisor and --eve-admin are required"
+  mkdir "$T/t"
+  cp "$EGW" "$T/t/eve-gw"; cp "$ESVC" "$T/t/eve-service"; cp "$ESUP" "$T/t/eve-supervisor"; cp "$EADM" "$T/t/eve-admin"
+  chmod 755 "$T/t/eve-gw" "$T/t/eve-service" "$T/t/eve-supervisor" "$T/t/eve-admin"
   (cd "$T/t" && tar -czf "$OUT/$ASSET.tar.gz" $(ls | sort))
 else
   ASSET="eve-web-$VER"

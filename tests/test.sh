@@ -1,10 +1,10 @@
 #!/bin/bash
-# Tests for bin/pack, bin/deploy and bin/next-version. No root, no network, no sudo: a fake health server and a fake "root watcher" stand in for the host.
+# Tests for bin/pack, bin/deploy and bin/next-version. No root, no network: a fake health server and a fake supervisor control socket stand in for the host.
 # Runs on Linux and macOS (system bash 3.2).   bash tests/test.sh
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd); R=$(cd "$HERE/.." && pwd)
 T=$(mktemp -d); PASS=0; FAILN=0
-cleanup() { [ -n "${SRV:-}" ] && kill "$SRV" 2>/dev/null; [ -n "${WAT:-}" ] && kill "$WAT" 2>/dev/null; rm -rf "$T"; }
+cleanup() { [ -n "${SRV:-}" ] && kill "$SRV" 2>/dev/null; [ -n "${CTL:-}" ] && kill "$CTL" 2>/dev/null; rm -rf "$T"; }
 trap cleanup EXIT
 ok() { PASS=$((PASS + 1)); printf '  PASS  %s\n' "$1"; }
 bad() { FAILN=$((FAILN + 1)); printf '  FAIL  %s\n' "$1"; }
@@ -12,44 +12,92 @@ check() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (got '$2', want '$3')";
 sha_of() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
 
 # ---------- fake host ----------
-export EVE_ROOT=$T/root EVE_RESTART_DONE=$T/done EVE_HEALTH_WAIT=4 EVE_RESTART_WAIT=6
+export EVE_ROOT=$T/root EVE_RELEASE_ROOT=$T/root/deploy EVE_CONTROL_SOCKET=$T/run/supervisor.sock EVE_HEALTH_WAIT=4
 PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
-export EVE_HEALTH_URL=http://127.0.0.1:$PORT/health EVE_UI_URL=http://127.0.0.1:$PORT/ui/ EVE_VERSION_URL=http://127.0.0.1:$PORT/_deploy/version
+export EVE_UI_URL=http://127.0.0.1:$PORT/ui/
 mkdir -p "$EVE_ROOT/bin" "$EVE_ROOT/web"
 cat >"$T/srv.py" <<PY
-import http.server, os, json
+import http.server, os
 T="$T"; ROOT="$EVE_ROOT"
 class H(http.server.BaseHTTPRequestHandler):
     def log_message(self,*a): pass
     def do_GET(self):
-        code, body = 404, b""
+        code = 404
         if self.path == "/health": code = 503 if os.path.exists(T+"/unhealthy") else 200
         elif self.path.startswith("/ui/"):
             f = ROOT+"/web/index.html"; code = 200 if os.path.exists(f) and b"BAD" not in open(f,"rb").read() else 503
-        elif self.path == "/_deploy/version":
-            # like the gateway: loopback only (no proxy headers), 404 for everything else; 404 as well for an old binary that has no such endpoint
-            if self.headers.get("X-Forwarded-For") or os.path.exists(T+"/noendpoint"): code = 404
-            else: code = 200; body = json.dumps({"version": open(T+"/running").read().strip(), "commit": "unknown"}).encode()
-        self.send_response(code); self.end_headers(); self.wfile.write(body)
+        self.send_response(code); self.end_headers()
 http.server.HTTPServer(("127.0.0.1",$PORT),H).serve_forever()
 PY
 python3 "$T/srv.py" & SRV=$!
-# the "root watcher": when the trigger changes, "restart" the gateway = look at the installed binary
-( last=""; while :; do cur=$(cat "$EVE_ROOT/restart.trigger" 2>/dev/null || true)
-  if [ -n "$cur" ] && [ "$cur" != "$last" ]; then last=$cur
-    if grep -q UNHEALTHY "$EVE_ROOT/bin/gateway" 2>/dev/null; then : >"$T/unhealthy"; else rm -f "$T/unhealthy"; fi
-    if grep -q NOENDPOINT "$EVE_ROOT/bin/gateway" 2>/dev/null; then : >"$T/noendpoint"; else rm -f "$T/noendpoint"; fi
-    if ! grep -q STALE "$EVE_ROOT/bin/gateway" 2>/dev/null; then "$EVE_ROOT/bin/gateway" -version >"$T/running" 2>/dev/null; fi   # STALE: the old process keeps running (restart did not take)
-    printf '%s.%s\n' "$(date +%s)" "$RANDOM" >"$EVE_RESTART_DONE"; fi; sleep 0.2; done ) & WAT=$!
-sleep 1
+# fake eve-supervisor control socket. Directory mode 0700, socket mode 0600 (eve-serving #265).
+cat >"$T/ctl.py" <<PY
+import json, os, socket, threading
+T="$T"; ROOT="$EVE_RELEASE_ROOT"; SOCK="$EVE_CONTROL_SOCKET"; LOG="$T/sock.log"
+os.makedirs(os.path.dirname(SOCK), mode=0o700)
+os.chmod(os.path.dirname(SOCK), 0o700)
+if os.path.exists(SOCK): os.remove(SOCK)
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(SOCK); os.chmod(SOCK, 0o600); srv.listen(16)
+state = {}
+def handle(conn):
+    try:
+        data = b""
+        while len(data) < 65536:
+            b = conn.recv(4096)
+            if not b: break
+            data += b
+            if b"\\n" in data: break
+        req = json.loads(data.decode() or "{}")
+        with open(LOG, "a") as f: f.write(json.dumps(req, sort_keys=True) + "\\n")
+        child, cmd = req.get("child", ""), req.get("command", "")
+        cur, prev = state.get(child, ["", ""])
+        res = {"ok": False, "action": cmd, "child": child, "from": cur, "to": "", "rolled_back": False}
+        if cmd == "deploy":
+            ver = req.get("version", ""); res["to"] = ver
+            if ver == cur and cur != "":
+                res["error"] = "version is already current"
+            else:
+                marker = ""
+                p = os.path.join(ROOT, "releases", ver, "bin", "eve-gw")
+                if os.path.isfile(p): marker = open(p).read()
+                if "UNHEALTHY" in marker or "STALE" in marker:
+                    res["rolled_back"] = True
+                    res["rollback_healthy"] = "RESTORE_FAIL" not in marker
+                    res["error"] = "version mismatch: running other" if "STALE" in marker else "health check timed out"
+                elif "REJECT" in marker:
+                    res["error"] = "release check failed"
+                else:
+                    state[child] = [ver, cur]; res["ok"] = True; res["from"] = cur; res["to"] = ver
+        elif cmd == "rollback":
+            if not prev: res["error"] = "no previous release"
+            else:
+                state[child] = [prev, cur]; res["ok"] = True; res["from"] = cur; res["to"] = prev
+        else:
+            res["error"] = "unknown command"
+        open(os.path.join(T, "running"), "w").write(state.get("gateway", ["", ""])[0])
+        conn.sendall((json.dumps(res) + "\\n").encode())
+    finally:
+        conn.close()
+def serve():
+    while True:
+        c, _ = srv.accept()
+        threading.Thread(target=handle, args=(c,), daemon=True).start()
+serve()
+PY
+python3 "$T/ctl.py" & CTL=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ -S "$EVE_CONTROL_SOCKET" ] && break; sleep 0.1; done
 
 # ---------- helpers: build a gateway / web release with bin/pack ----------
-mk_gw() { # version [UNHEALTHY]
-  local d=$T/rel-gw-$1; mkdir -p "$d/in"
-  printf '#!/bin/sh\n# %s\n[ "$1" = -version ] && echo %s\nexit 0\n' "${2:-ok}" "$1" >"$d/in/gateway"; chmod +x "$d/in/gateway"
-  cp "$d/in/gateway" "$d/in/eve-gw"
-  bash "$R/bin/pack" gateway --version "$1" --commit 0123456789abcdef0123456789abcdef01234567 --gateway "$d/in/gateway" --eve-gw "$d/in/eve-gw" --out "$d/out" >/dev/null && echo "$d/out"
+mk_gw() { # version [marker]
+  local d=$T/rel-gw-$1 b; mkdir -p "$d/in"
+  printf '#!/bin/sh\n# %s\n[ "$1" = -version ] && echo %s\nexit 0\n' "${2:-ok}" "$1" >"$d/in/eve-gw"; chmod +x "$d/in/eve-gw"
+  for b in eve-service eve-supervisor eve-admin; do cp "$d/in/eve-gw" "$d/in/$b"; done
+  bash "$R/bin/pack" gateway --version "$1" --commit 0123456789abcdef0123456789abcdef01234567 \
+    --eve-gw "$d/in/eve-gw" --eve-service "$d/in/eve-service" --eve-supervisor "$d/in/eve-supervisor" --eve-admin "$d/in/eve-admin" \
+    --out "$d/out" >/dev/null && echo "$d/out"
 }
+mode_of() { python3 -c 'import os,sys; print(format(os.stat(sys.argv[1]).st_mode & 0o777, "04o"))' "$1"; }
 mk_web() { # version [BAD]
   local d=$T/rel-web-$1; mkdir -p "$d/repo"; ( cd "$d/repo" && git init -q . && printf '<html>%s %s</html>\n' "$1" "${2:-good}" >index.html && echo "x" >README.md && mkdir -p tests && echo t >tests/a && git add -A && git -c user.email=t@t -c user.name=t commit -qm i )
   bash "$R/bin/pack" web --version "$1" --commit 0123456789abcdef0123456789abcdef01234567 --web-dir "$d/repo" --out "$d/out" >/dev/null && echo "$d/out"
@@ -59,38 +107,48 @@ res() { sed -n "s/.*\"$1\":\"\\([^\"]*\\)\".*/\\1/p" "$EVE_ROOT/state/result.jso
 
 echo "== pack"
 G1=$(mk_gw 1.0.0); [ -f "$G1/eve-gateway-1.0.0-darwin-arm64.tar.gz" ] && [ -f "$G1/manifest.json" ] && ok "gateway files produced" || bad "gateway files produced"
+check "gateway tar is the four binaries" "$(tar -tzf "$G1/eve-gateway-1.0.0-darwin-arm64.tar.gz" | sort | tr '\n' ' ')" "eve-admin eve-gw eve-service eve-supervisor "
 check "sha256 file matches the tarball" "$(awk '{print $1}' "$G1/eve-gateway-1.0.0-darwin-arm64.tar.gz.sha256")" "$(sha_of "$G1/eve-gateway-1.0.0-darwin-arm64.tar.gz")"
 W1=$(mk_web 1.0.0); check "web tar excludes README.md and tests/" "$(tar -tzf "$W1/eve-web-1.0.0.tar.gz" | sort | tr '\n' ' ')" "index.html "
-if bash "$R/bin/pack" gateway --version 1.0 --commit x --gateway /nonexistent --out "$T/o" >/dev/null 2>&1; then bad "pack refuses a bad version"; else ok "pack refuses a bad version"; fi
+if bash "$R/bin/pack" gateway --version 1.0 --commit 0123456789abcdef0123456789abcdef01234567 --eve-gw x --eve-service x --eve-supervisor x --eve-admin x --out "$T/o" >/dev/null 2>&1; then bad "pack refuses a bad version"; else ok "pack refuses a bad version"; fi
+if bash "$R/bin/pack" gateway --version 1.0.0 --commit 0123456789abcdef0123456789abcdef01234567 --gateway x --eve-gw x --eve-service x --eve-supervisor x --eve-admin x --out "$T/o" >/dev/null 2>&1; then bad "pack refuses the old --gateway argument"; else ok "pack refuses the old --gateway argument"; fi
 
 # web tree with a symlink / without index.html is refused
 mkdir -p "$T/sl" && ( cd "$T/sl" && git init -q . && echo h >index.html && ln -s /etc/passwd evil && git add -A && git -c user.email=t@t -c user.name=t commit -qm i )
 if bash "$R/bin/pack" web --version 1.0.0 --commit 0123456789abcdef0123456789abcdef01234567 --web-dir "$T/sl" --out "$T/slo" >/dev/null 2>&1; then bad "pack refuses a web tree with a symlink"; else ok "pack refuses a web tree with a symlink"; fi
 
 echo "== gateway deploy"
+check "control socket directory is 0700" "$(mode_of "$(dirname "$EVE_CONTROL_SOCKET")")" 0700
+check "control socket is 0600" "$(mode_of "$EVE_CONTROL_SOCKET")" 0600
 $D deploy gateway 1.0.0 --from "$G1" >"$T/o1" 2>&1; check "first deploy exits 0" "$?" 0
 check "state says 1.0.0" "$(cat "$EVE_ROOT/state/gateway.version")" 1.0.0
 check "result.json status" "$(res status)" success
-check "installed gateway runs" "$("$EVE_ROOT/bin/gateway" -version)" 1.0.0
+check "installed eve-gw runs" "$("$EVE_RELEASE_ROOT/releases/1.0.0/bin/eve-gw" -version)" 1.0.0
+check "release directory is 0700" "$(mode_of "$EVE_RELEASE_ROOT/releases/1.0.0")" 0700
+check "supervisor deploy was called" "$(grep -c '{"child": "gateway", "command": "deploy", "version": "1.0.0"}' "$T/sock.log")" 1
+check "supervisor reports 1.0.0 current" "$(cat "$T/running")" 1.0.0
 $D deploy gateway 1.0.0 --from "$G1" >/dev/null 2>&1; check "same version again: exit 0" "$?" 0; check "same version again: unchanged" "$(res status)" unchanged
+check "same version does not call the socket again" "$(grep -c '"command": "deploy"' "$T/sock.log")" 1
 G2=$(mk_gw 1.1.0)
 $D deploy gateway 1.1.0 --from "$G2" >/dev/null 2>&1; check "update exits 0" "$?" 0
 check "previous version kept" "$(cat "$EVE_ROOT/state/gateway.previous")" 1.0.0
 check "result.json from/to" "$(res from)->$(res to)" "1.0.0->1.1.0"
+check "supervisor now on 1.1.0" "$(cat "$T/running")" 1.1.0
 G3=$(mk_gw 1.2.0 UNHEALTHY)
 $D deploy gateway 1.2.0 --from "$G3" >/dev/null 2>&1; check "unhealthy release exits 1" "$?" 1
 check "unhealthy release: status rolled-back" "$(res status)" rolled-back
-check "unhealthy release: old binary restored" "$("$EVE_ROOT/bin/gateway" -version)" 1.1.0
+check "unhealthy release: health restored" "$(res health)" restored
+check "unhealthy release: supervisor stayed on 1.1.0" "$(cat "$T/running")" 1.1.0
 check "unhealthy release: state unchanged" "$(cat "$EVE_ROOT/state/gateway.version")" 1.1.0
-check "unhealthy release: service healthy again" "$(curl -s -o /dev/null -w '%{http_code}' "$EVE_HEALTH_URL")" 200
 $D rollback gateway >/dev/null 2>&1; check "rollback exits 0" "$?" 0
-check "rollback: now 1.0.0" "$("$EVE_ROOT/bin/gateway" -version)" 1.0.0
+check "rollback: supervisor now 1.0.0" "$(cat "$T/running")" 1.0.0
 check "rollback: state" "$(cat "$EVE_ROOT/state/gateway.version")" 1.0.0
+check "rollback called the socket" "$(grep -c '{"child": "gateway", "command": "rollback"}' "$T/sock.log")" 1
 # tampered tarball
 G4=$(mk_gw 1.3.0); echo junk >>"$G4/eve-gateway-1.3.0-darwin-arm64.tar.gz"
 $D deploy gateway 1.3.0 --from "$G4" >"$T/o4" 2>&1; check "tampered tarball refused" "$?" 1
 grep -q "sha256" "$T/o4" && ok "tampered tarball: reason is the sha256" || bad "tampered tarball: reason is the sha256"
-check "tampered tarball: nothing changed" "$("$EVE_ROOT/bin/gateway" -version)" 1.0.0
+check "tampered tarball: nothing changed" "$(cat "$T/running")" 1.0.0
 # manifest of another version
 G5=$(mk_gw 1.4.0); sed -i.bak 's/"version": "1.4.0"/"version": "9.9.9"/' "$G5/manifest.json"
 $D deploy gateway 1.4.0 --from "$G5" >/dev/null 2>&1; check "manifest/version mismatch refused" "$?" 1
@@ -102,28 +160,35 @@ if [ -f "$T/evil/eve-gateway-1.5.0-darwin-arm64.tar.gz" ]; then
   $D deploy gateway 1.5.0 --from "$T/evil" >/dev/null 2>&1; check "tar with .. path refused" "$?" 1
 else ok "tar with .. path refused (tar cannot build the sample here: skipped)"; fi
 # a release containing a symlink is refused
-mkdir -p "$T/ln/in" && ( cd "$T/ln/in" && printf '#!/bin/sh\nexit 0\n' >gateway && chmod +x gateway && ln -s /etc/passwd eve-gw && tar -czf ../eve-gateway-1.5.1-darwin-arm64.tar.gz gateway eve-gw )
+mkdir -p "$T/ln/in" && ( cd "$T/ln/in" && printf '#!/bin/sh\nexit 0\n' >eve-gw && chmod +x eve-gw && ln -s /etc/passwd eve-service && tar -czf ../eve-gateway-1.5.1-darwin-arm64.tar.gz eve-gw eve-service )
 H=$(sha_of "$T/ln/eve-gateway-1.5.1-darwin-arm64.tar.gz"); echo "$H  x" >"$T/ln/eve-gateway-1.5.1-darwin-arm64.tar.gz.sha256"; printf '{"component":"gateway","version":"1.5.1","commit":"x"}\n' >"$T/ln/manifest.json"
 $D deploy gateway 1.5.1 --from "$T/ln" >/dev/null 2>&1; check "tar with a symlink refused" "$?" 1
-# version endpoint (C4): the new version must be the one that answers; a stale process is rolled back
+# supervisor reports a version mismatch: the deploy is rolled back and state stays
 G6=$(mk_gw 1.6.0 STALE); $D deploy gateway 1.6.0 --from "$G6" >/dev/null 2>&1; check "stale process (wrong version answers) is rolled back" "$?" 1
 check "stale process: status" "$(res status)" rolled-back
 check "stale process: still on the old version" "$(cat "$EVE_ROOT/state/gateway.version")" 1.0.0
 # a release without manifest.json (made by hand) deploys
 G7=$(mk_gw 1.7.0); rm "$G7/manifest.json"; $D deploy gateway 1.7.0 --from "$G7" >/dev/null 2>&1; check "release without manifest.json deploys" "$?" 0
-# the proxied/tailnet path gets 404 (loopback only)
-check "version endpoint refuses a proxied request" "$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Forwarded-For: 100.64.0.1' "$EVE_VERSION_URL")" 404
-check "version endpoint answers on loopback" "$(curl -s -o /dev/null -w '%{http_code}' "$EVE_VERSION_URL")" 200
-# an older gateway without the endpoint: strict deploy refuses it, restoring it (rollback) works
-G8=$(mk_gw 0.9.0 NOENDPOINT); $D deploy gateway 0.9.0 --from "$G8" >/dev/null 2>&1; check "new version without the endpoint fails the strict check" "$?" 1
-EVE_VERSION_CHECK=off $D deploy gateway 0.9.0 --from "$G8" >/dev/null 2>&1; check "EVE_VERSION_CHECK=off installs it on health only" "$?" 0
-G9=$(mk_gw 0.9.1 UNHEALTHY); $D deploy gateway 0.9.1 --from "$G9" >/dev/null 2>&1
-check "restore of an old gateway without the endpoint is accepted" "$(res status)" rolled-back
-check "...and the old binary is back" "$("$EVE_ROOT/bin/gateway" -version)" 0.9.0
-$D deploy gateway 2.0.0 --from "$(mk_gw 2.0.0)" >/dev/null 2>&1; check "deploy over it works" "$?" 0
-# the production plist template turns on startup migrations (BE decision, C5)
+# supervisor rejects the release before swapping: nothing is rolled back because nothing switched
+GR=$(mk_gw 1.8.0 REJECT); $D deploy gateway 1.8.0 --from "$GR" >/dev/null 2>&1; check "rejected release exits 1" "$?" 1
+check "rejected release: status failed" "$(res status)" failed
+check "rejected release: still 1.7.0" "$(cat "$T/running")" 1.7.0
+# supervisor rolled back but the restored build is not healthy
+GF=$(mk_gw 1.9.0 'UNHEALTHY RESTORE_FAIL'); $D deploy gateway 1.9.0 --from "$GF" >/dev/null 2>&1; check "restore failure exits 1" "$?" 1
+check "restore failure: status rolled-back" "$(res status)" rolled-back
+check "restore failure: health restore-failed" "$(res health)" restore-failed
+check "restore failure: state unchanged" "$(cat "$EVE_ROOT/state/gateway.version")" 1.7.0
+# the production plist template turns on startup migrations (BE decision, C5). setup no longer edits a gateway daemon.
 grep -q '<key>GW_DB_AUTO_MIGRATE</key><string>true</string>' "$R/deploy/launchd-go/gateway.plist.template" && ok "plist template sets GW_DB_AUTO_MIGRATE=true" || bad "plist template sets GW_DB_AUTO_MIGRATE=true"
-grep -q 'GW_DB_AUTO_MIGRATE' "$R/host/setup.sh" && ok "host setup sets GW_DB_AUTO_MIGRATE in the live plist" || bad "host setup sets GW_DB_AUTO_MIGRATE in the live plist"
+if grep -q 'restart-watcher\|com.llmserving.gateway' "$R/host/setup.sh"; then bad "setup still installs the watcher or gateway daemon"; else ok "setup does not install the watcher or gateway daemon"; fi
+# a socket directory other people can enter is refused (#265)
+chmod 755 "$(dirname "$EVE_CONTROL_SOCKET")"
+BEFORE=$(wc -l <"$T/sock.log" | tr -d ' ')
+$D deploy gateway 3.0.0 --from "$(mk_gw 3.0.0)" >"$T/o755" 2>&1; check "0755 socket directory is refused" "$?" 1
+grep -q '0700' "$T/o755" && ok "0755 socket directory: reason is 0700" || bad "0755 socket directory: reason is 0700"
+check "0755 socket directory: no command was sent" "$(wc -l <"$T/sock.log" | tr -d ' ')" "$BEFORE"
+check "0755 socket directory: state unchanged" "$(cat "$EVE_ROOT/state/gateway.version")" 1.7.0
+chmod 700 "$(dirname "$EVE_CONTROL_SOCKET")"
 # a lock left by a running deploy blocks a second one
 mkdir "$EVE_ROOT/state/lock"; $D deploy gateway 1.7.0 --from "$G6" >/dev/null 2>&1; check "second deploy while one runs is refused" "$?" 1; rmdir "$EVE_ROOT/state/lock"
 
@@ -208,6 +273,8 @@ check "index.html and sw.js leave first" "$(grep " $E/previous/web/\$" "$T/mvlog
 check "index.html then sw.js come back last" "$INS" "index.html sw.js "
 chmod 755 "$EVE_ROOT"
 check "no sudo anywhere in the scripts" "$(cat "$R"/bin/* | sed 's/#.*//' | grep -c '\bsudo\b')" 0
+HITS=$(grep -R -n -E 'sudo|LaunchDaemon|restart-watcher' "$R" --exclude-dir=.git --exclude-dir=ci-vm --exclude=setup.sh --exclude=guard-install.sh --exclude=test.sh || true)
+if [ -n "$HITS" ]; then bad "sudo, LaunchDaemon, or restart-watcher outside runner install"; printf '%s\n' "$HITS"; else ok "no sudo, LaunchDaemon, or restart-watcher outside runner install"; fi
 
 echo "== next-version"
 N=$T/nv; mkdir -p "$N" && cd "$N" && git init -q . && git config user.email t@t && git config user.name t
