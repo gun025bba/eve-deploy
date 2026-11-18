@@ -2,10 +2,9 @@
 # One-time host setup for tag-driven deploys. Run ONCE by an admin:   sudo bash host/setup.sh
 # Everything after this is automatic: a merge into main -> GitHub Actions -> this host's runner -> bin/deploy.
 #
-# What it does (nothing else; it does not touch config, data, secrets or the existing gateway service):
-#   1. makes the runner account own only the code directories under /opt/eve-gw (bin, web, previous, state)
-#   2. installs the restart watcher (root-owned): lets the non-admin runner account restart exactly one service without sudo
-#   3. installs one self-hosted runner per repo (label "eve-host"), running as the non-admin account, outbound HTTPS only
+# What it does (nothing else; it does not touch config, data, secrets or a running supervisor):
+#   1. makes the runner account own the code directories under /opt/eve-gw, plus the supervisor release root and socket directory
+#   2. installs one self-hosted runner per repo (label "eve-host"), running as the non-admin account, outbound HTTPS only
 #
 # Runner registration tokens come from GitHub (repo -> Settings -> Actions -> Runners -> New self-hosted runner), valid 1 hour.
 # They are read from the terminal (or from RUNNER_TOKEN_EVE_SERVING / RUNNER_TOKEN_EVE_WEB) and never written to disk.
@@ -26,38 +25,14 @@ if dscl . -read /Groups/admin GroupMembership 2>/dev/null | tr ' ' '\n' | grep -
   echo "refusing: $RUNNER_USER is an admin account. The runner must not be admin." >&2; exit 1
 fi
 
-echo "== 1/3 code directories owned by $RUNNER_USER"
+echo "== 1/2 code directories owned by $RUNNER_USER"
 for d in bin web previous state; do mkdir -p "$EVE_ROOT/$d"; chown -R "$RUNNER_USER" "$EVE_ROOT/$d"; chmod -R go+rX "$EVE_ROOT/$d"; done
-: >"$EVE_ROOT/restart.trigger"; chown "$RUNNER_USER" "$EVE_ROOT/restart.trigger"; chmod 644 "$EVE_ROOT/restart.trigger"
+# release_root and the control-socket directory. 0700: the supervisor refuses a socket directory that is not private.
+install -d -o "$RUNNER_USER" -m 0700 "$EVE_ROOT/deploy" "$EVE_ROOT/run"
+chown "$RUNNER_USER" "$EVE_ROOT/deploy" "$EVE_ROOT/run"
+chmod 700 "$EVE_ROOT/deploy" "$EVE_ROOT/run"
 
-echo "== 2/3 restart watcher"
-mkdir -p /usr/local/libexec /var/db/eve-restart && chmod 755 /var/db/eve-restart
-install -o root -g wheel -m 755 "$HERE/restart-watcher.sh" /usr/local/libexec/eve-restart-watcher
-sed "s#__EVE_ROOT__#$EVE_ROOT#g" "$HERE/restart-watcher.plist.template" >/Library/LaunchDaemons/com.eve.restart-watcher.plist
-chown root:wheel /Library/LaunchDaemons/com.eve.restart-watcher.plist; chmod 644 /Library/LaunchDaemons/com.eve.restart-watcher.plist
-launchctl bootout system/com.eve.restart-watcher 2>/dev/null || true
-launchctl bootstrap system /Library/LaunchDaemons/com.eve.restart-watcher.plist
-
-echo "== gateway: migrations on startup (GW_DB_AUTO_MIGRATE=true)"
-# BE decision (C5): the gateway applies its own forward-only migrations at start; the deploy step never touches the database.
-# Only this one key of the live plist is changed (a backup is kept next to it); nothing is printed from the plist. It takes effect at the next restart = the next deploy.
-GW_PLIST=${GW_PLIST:-/Library/LaunchDaemons/com.llmserving.gateway.plist}
-PB=/usr/libexec/PlistBuddy
-if [ -f "$GW_PLIST" ]; then
-  if [ "$("$PB" -c 'Print :EnvironmentVariables:GW_DB_AUTO_MIGRATE' "$GW_PLIST" 2>/dev/null || true)" = true ]; then
-    echo "  already true"
-  else
-    cp -p "$GW_PLIST" "$GW_PLIST.pre-eve-deploy" && chmod 600 "$GW_PLIST.pre-eve-deploy"
-    "$PB" -c 'Print :EnvironmentVariables' "$GW_PLIST" >/dev/null 2>&1 || "$PB" -c 'Add :EnvironmentVariables dict' "$GW_PLIST"
-    "$PB" -c 'Set :EnvironmentVariables:GW_DB_AUTO_MIGRATE true' "$GW_PLIST" >/dev/null 2>&1 || "$PB" -c 'Add :EnvironmentVariables:GW_DB_AUTO_MIGRATE string true' "$GW_PLIST"
-    plutil -lint "$GW_PLIST" >/dev/null || { echo "plist is not valid after the change; restoring the backup" >&2; cp -p "$GW_PLIST.pre-eve-deploy" "$GW_PLIST"; exit 1; }
-    echo "  set to true (backup: $GW_PLIST.pre-eve-deploy); active at the next gateway restart"
-  fi
-else
-  echo "  $GW_PLIST not found: set GW_DB_AUTO_MIGRATE=true in the gateway's launchd environment yourself (or re-run with GW_PLIST=<path>)"
-fi
-
-echo "== 3/3 self-hosted runners"
+echo "== 2/2 self-hosted runners"
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 curl -fsSL --retry 5 -o "$TMP/$RUNNER_ASSET" "https://github.com/actions/runner/releases/download/v$RUNNER_VERSION/$RUNNER_ASSET"
 [ "$(shasum -a 256 "$TMP/$RUNNER_ASSET" | awk '{print $1}')" = "$RUNNER_SHA256" ] || { echo "runner download does not match the pinned sha256; stopping" >&2; exit 1; }
