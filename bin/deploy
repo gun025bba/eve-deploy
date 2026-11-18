@@ -46,7 +46,15 @@ sha_of() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{
 cur_version() { cat "$ST/$1.version" 2>/dev/null || true; }
 prev_version() { cat "$ST/$1.previous" 2>/dev/null || true; }
 json_get() { sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" "$1" | head -1; }
-json_bool() { sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\\(true\\|false\\).*/\\1/p" "$1" | head -1; }
+# BSD sed (macOS) has no alternation, so true and false are matched separately.
+json_bool() { # $1 file $2 key -> true, false, or empty
+  local line
+  line=$(sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*true.*/true/p" "$1" | head -1 || true)
+  if [ "$line" = true ]; then printf '%s\n' true; return 0; fi
+  line=$(sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*false.*/false/p" "$1" | head -1 || true)
+  if [ "$line" = false ]; then printf '%s\n' false; return 0; fi
+  return 0
+}
 file_mode() { # permission bits without the leading zero (700)
   local m; if [ "$(uname -s)" = Darwin ]; then m=$(stat -f '%Lp' "$1"); else m=$(stat -c '%a' "$1"); fi
   printf '%s\n' "${m#0}"
