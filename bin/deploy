@@ -9,7 +9,7 @@
 # and /_deploy/version, and rolls back itself. This script only records the supervisor's result.
 # Web is still a file tree swap (no process to restart).
 # Exit 0 = the requested version (or, for rollback, the previous one) is live and healthy. The outcome
-# is written to $EVE_ROOT/state/result.json and, in CI, to the job summary.
+# is written to ${EVE_STATE_DIR:-$EVE_ROOT/state}/result.json and, in CI, to the job summary.
 # Integrity: sha256 of the tarball only (a transport check, not a signature). Written for macOS /bin/bash 3.2 and BSD tools.
 set -uo pipefail
 export LC_ALL=C
@@ -26,7 +26,7 @@ EVE_HEALTH_WAIT=${EVE_HEALTH_WAIT:-90}        # seconds the new web tree has to 
 EVE_FETCH_RETRIES=${EVE_FETCH_RETRIES:-5}
 RELEASE_BINS="eve-gw eve-service eve-supervisor eve-admin"
 
-WEB=$EVE_ROOT/web; ST=$EVE_ROOT/state
+WEB=$EVE_ROOT/web; ST=${EVE_STATE_DIR:-$EVE_ROOT/state}   # state files; default is $EVE_ROOT/state
 PREV_WEB=$EVE_ROOT/previous/web
 
 now() { date '+%Y-%m-%dT%H:%M:%S%z'; }
@@ -76,19 +76,24 @@ wait_healthy() { # $1 component (web)
 # ----- supervisor control socket (protocol of eve-serving internal/supervisor/control.go) -----
 # One JSON request {"command","child","version"} per connection, one JSON result.
 # The socket directory is the boundary: it must be a real directory, mode 0700, owned by this user.
-supervisor_call() { # $1 command $2 child $3 version (deploy only)
-  local sock dir mode uid
+supervisor_call() { # $1 command $2 child $3 version (deploy only). status failures return 1.
+  local sock dir mode uid cmd
+  cmd=$1
+  refuse() {
+    if [ "$cmd" = status ]; then log "supervisor status unavailable: $*"; return 1; fi
+    die "$*"
+  }
   sock=$EVE_CONTROL_SOCKET; dir=$(dirname "$sock")
-  [ -L "$dir" ] && die "control socket directory is a symlink"
-  [ -d "$dir" ] || die "control socket directory is missing ($dir)"
+  [ -L "$dir" ] && { refuse "control socket directory is a symlink" || return 1; }
+  [ -d "$dir" ] || { refuse "control socket directory is missing ($dir)" || return 1; }
   mode=$(file_mode "$dir"); uid=$(file_uid "$dir")
-  [ "$mode" = 700 ] || die "control socket directory must be private (0700), found $mode"
-  [ "$uid" = "$(id -u)" ] || die "control socket directory must be owned by this user"
-  [ -L "$sock" ] && die "control socket path is a symlink"
-  [ -S "$sock" ] || die "control socket is not available ($sock)"
-  command -v python3 >/dev/null 2>&1 || die "python3 is required to talk to the supervisor control socket"
+  [ "$mode" = 700 ] || { refuse "control socket directory must be private (0700), found $mode" || return 1; }
+  [ "$uid" = "$(id -u)" ] || { refuse "control socket directory must be owned by this user" || return 1; }
+  [ -L "$sock" ] && { refuse "control socket path is a symlink" || return 1; }
+  [ -S "$sock" ] || { refuse "control socket is not available ($sock)" || return 1; }
+  command -v python3 >/dev/null 2>&1 || { refuse "python3 is required to talk to the supervisor control socket" || return 1; }
   log "supervisor $1 $2${3:+ $3}"
-  python3 - "$sock" "$1" "$2" "${3:-}" >"$ST/supervisor.last" <<'PY' || die "supervisor control call failed"
+  python3 - "$sock" "$1" "$2" "${3:-}" >"$ST/supervisor.last" <<'PY' || { refuse "supervisor control call failed" || return 1; }
 import json, socket, sys
 path, cmd, child, ver = sys.argv[1:5]
 req = {"command": cmd, "child": child}
@@ -113,7 +118,26 @@ if not data.strip():
     sys.exit(1)
 sys.stdout.write(data.decode())
 PY
-  [ -s "$ST/supervisor.last" ] || die "supervisor returned an empty result"
+  [ -s "$ST/supervisor.last" ] || { refuse "supervisor returned an empty result" || return 1; }
+}
+
+# current/previous of the first supervisor child. Empty, and not fatal, when the supervisor cannot be read.
+sup_child_field() { # $1 current|previous -> version or empty
+  local child
+  child=${EVE_SUPERVISOR_CHILDREN%% *}
+  [ -n "$child" ] || return 0
+  supervisor_call status "$child" >/dev/null 2>&1 || return 0
+  python3 - "$ST/supervisor.last" "$child" "$1" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+for c in d.get("children", []):
+    if c.get("name") == sys.argv[2]:
+        print(c.get(sys.argv[3]) or "")
+        break
+PY
 }
 
 # $1 result file, $2 1 when any sibling rollback also succeeded
@@ -270,6 +294,7 @@ rollback_web_tree() { # swap the contents of $WEB and $PREV_WEB through $keep. 0
 do_deploy() { # $1 component $2 version $3 from-dir (may be empty)
   COMPONENT=$1; TO_V=$2; FROM_V=$(cur_version "$1")
   valid_version "$2" || die "bad version '$2'"
+  if [ "$1" = gateway ] && [ -z "$FROM_V" ]; then FROM_V=$(sup_child_field current); [ -z "$FROM_V" ] || log "state has no gateway version; supervisor current is $FROM_V"; fi
   local work asset rc
   mkdir -p "$ST" || die "cannot create $ST"
   work=$(mktemp -d "$ST/work.XXXXXX") || die "cannot create a work dir"
@@ -315,6 +340,12 @@ do_deploy() { # $1 component $2 version $3 from-dir (may be empty)
 do_rollback() { # $1 component
   COMPONENT=$1; FROM_V=$(cur_version "$1"); TO_V=$(prev_version "$1")
   mkdir -p "$ST" || die "cannot create $ST"
+  if [ "$1" = gateway ]; then
+    local sp sc
+    sp=$(sup_child_field previous); sc=$(sup_child_field current)
+    [ -n "$FROM_V" ] || FROM_V=$sc
+    if [ -n "$sp" ] && [ "$sp" != "$TO_V" ]; then log "state previous ${TO_V:-none} differs from supervisor previous $sp: using the supervisor"; TO_V=$sp; fi
+  fi
   [ -n "$TO_V" ] || die "no previous $1 version is kept"
   log "rolling $1 back $FROM_V -> $TO_V"
   if [ "$1" = gateway ]; then

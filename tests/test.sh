@@ -73,6 +73,11 @@ def handle(conn):
             if not prev: res["error"] = "no previous release"
             else:
                 state[child] = [prev, cur]; res["ok"] = True; res["from"] = cur; res["to"] = prev
+        elif cmd == "status":
+            if os.path.exists(os.path.join(T, "status-fail")):
+                return
+            kids = [{"name": n, "current": p[0], "previous": p[1]} for n, p in state.items()]
+            res = {"ok": True, "action": "status", "children": kids}
         else:
             res["error"] = "unknown command"
         open(os.path.join(T, "running"), "w").write(state.get("gateway", ["", ""])[0])
@@ -207,11 +212,7 @@ case "$user" in
 esac
 exit 1
 SH
-cat >"$T/idbin/dscl" <<'SH'
-#!/bin/bash
-printf '%s\n' "${DSCL_MEMBERSHIP:-GroupMembership: root admin}"
-SH
-chmod +x "$T/idbin/id" "$T/idbin/dscl"
+chmod +x "$T/idbin/id"
 OUT=$(PATH="$T/idbin:$PATH" run_cutover EVE_RUN_USER=login-account)
 echo "$OUT" | grep -q 'install -d -o login-account ' && ok "cutover one-liner passes EVE_RUN_USER to install" || bad "cutover one-liner passes EVE_RUN_USER to install"
 echo "$OUT" | grep -q 'chown login-account ' && ok "cutover one-liner passes EVE_RUN_USER to chown" || bad "cutover one-liner passes EVE_RUN_USER to chown"
@@ -236,13 +237,12 @@ OUT=$(run_cutover EVE_RUN_USER=eve-no-such-account)
 check "cutover one-liner refuses a missing account" "$?" 1
 echo "$OUT" | grep -q 'account eve-no-such-account does not exist' && ok "cutover one-liner says the account does not exist" || bad "cutover one-liner says the account does not exist"
 echo "$OUT" | grep -q 'install -d' && bad "cutover one-liner stops before install for a missing account" || ok "cutover one-liner stops before install for a missing account"
-OUT=$(PATH="$T/idbin:$PATH" DSCL_MEMBERSHIP='GroupMembership: root admin adminuser' env EVE_RUN_USER=adminuser bash "$R/host/setup.sh" 2>&1)
-check "setup refuses an admin account" "$?" 1
-echo "$OUT" | grep -q 'refusing: adminuser is an admin account' && ok "setup says the admin account is refused" || bad "setup says the admin account is refused"
-OUT=$(PATH="$T/idbin:$PATH" DSCL_MEMBERSHIP='GroupMembership: root admin adminuser' run_cutover EVE_RUN_USER=adminuser)
-check "cutover one-liner refuses an admin account" "$?" 1
-echo "$OUT" | grep -q 'refusing: adminuser is an admin account' && ok "cutover one-liner says the admin account is refused" || bad "cutover one-liner says the admin account is refused"
-echo "$OUT" | grep -q 'install -d' && bad "cutover one-liner stops before install for an admin" || ok "cutover one-liner stops before install for an admin"
+OUT=$(PATH="$T/idbin:$PATH" env EVE_RUN_USER=adminuser bash "$R/host/setup.sh" --check-run-user 2>&1)
+check "setup allows an admin login account" "$?" 0
+echo "$OUT" | grep -q 'is an admin account' && bad "setup does not reject an admin login account" || ok "setup does not reject an admin login account"
+OUT=$(PATH="$T/idbin:$PATH" run_cutover EVE_RUN_USER=adminuser)
+echo "$OUT" | grep -q 'install -d -o adminuser ' && ok "cutover one-liner allows an admin login account" || bad "cutover one-liner allows an admin login account"
+echo "$OUT" | grep -q 'is an admin account' && bad "cutover one-liner does not reject an admin login account" || ok "cutover one-liner does not reject an admin login account"
 # a socket directory other people can enter is refused (#265)
 chmod 755 "$(dirname "$EVE_CONTROL_SOCKET")"
 BEFORE=$(wc -l <"$T/sock.log" | tr -d ' ')
@@ -253,6 +253,36 @@ check "0755 socket directory: state unchanged" "$(cat "$EVE_ROOT/state/gateway.v
 chmod 700 "$(dirname "$EVE_CONTROL_SOCKET")"
 # a lock left by a running deploy blocks a second one
 mkdir "$EVE_ROOT/state/lock"; $D deploy gateway 1.7.0 --from "$G6" >/dev/null 2>&1; check "second deploy while one runs is refused" "$?" 1; rmdir "$EVE_ROOT/state/lock"
+
+echo "== gateway state dir and supervisor pointers"
+SA=$T/stateA; SB=$T/stateB; SC=$T/stateC
+GA=$(mk_gw 2.0.0); GB=$(mk_gw 2.1.0); GC=$(mk_gw 2.2.0); GD=$(mk_gw 2.4.0)
+EVE_STATE_DIR=$SA $D deploy gateway 2.0.0 --from "$GA" >/dev/null 2>&1
+EVE_STATE_DIR=$SA $D deploy gateway 2.1.0 --from "$GB" >/dev/null 2>&1
+rm -f "$SA/gateway.version" "$SA/gateway.previous"
+EVE_STATE_DIR=$SA $D deploy gateway 2.2.0 --from "$GC" >/dev/null 2>&1; check "empty state deploy uses supervisor current" "$?" 0
+check "empty state records supervisor current as previous" "$(cat "$SA/gateway.previous")" 2.1.0
+grep -q 'state has no gateway version; supervisor current is 2.1.0' "$SA/deploy.log" && ok "empty state logs the supervisor current" || bad "empty state logs the supervisor current"
+EVE_STATE_DIR=$SA $D rollback gateway >/dev/null 2>&1; check "rollback after empty-state deploy exits 0" "$?" 0
+check "rollback after empty-state deploy returns to supervisor previous" "$(cat "$SA/gateway.version")" 2.1.0
+printf '9.9.9\n' >"$SA/gateway.previous"; printf '2.1.0\n' >"$SA/gateway.version"
+EVE_STATE_DIR=$SA $D rollback gateway >"$T/rbdiff" 2>&1; check "rollback follows supervisor previous when state differs" "$?" 0
+grep -q 'state previous 9.9.9 differs from supervisor previous 2.2.0: using the supervisor' "$SA/deploy.log" && ok "rollback logs the supervisor previous" || bad "rollback logs the supervisor previous"
+check "rollback state version is the supervisor previous" "$(cat "$SA/gateway.version")" 2.2.0
+EVE_STATE_DIR=$SB $D deploy gateway 2.0.0 --from "$GA" >/dev/null 2>&1; check "EVE_STATE_DIR deploy exits 0" "$?" 0
+check "EVE_STATE_DIR holds the gateway version" "$(cat "$SB/gateway.version")" 2.0.0
+check "default state dir is left unchanged" "$(cat "$EVE_ROOT/state/gateway.version")" 1.7.0
+: >"$T/status-fail"
+mkdir -p "$SC"; rm -f "$SC/gateway.version" "$SC/gateway.previous"
+EVE_STATE_DIR=$SC $D deploy gateway 2.4.0 --from "$GD" >"$T/stfail" 2>&1; check "status failure does not stop the deploy" "$?" 0
+grep -q 'supervisor status unavailable' "$SC/deploy.log" && ok "status failure is logged" || bad "status failure is logged"
+check "status failure deploy records the new version" "$(cat "$SC/gateway.version")" 2.4.0
+check "status failure leaves the empty previous from the state file" "$(cat "$SC/gateway.previous")" ""
+printf '2.4.0\n' >"$SC/gateway.version"; printf '1.0.0\n' >"$SC/gateway.previous"
+EVE_STATE_DIR=$SC $D rollback gateway >"$T/stfailrb" 2>&1; check "status failure rollback uses the state file" "$?" 0
+check "status failure rollback keeps the state-file previous" "$(cat "$SC/gateway.version")" 1.0.0
+grep -q 'differs from supervisor previous' "$T/stfailrb" && bad "status failure rollback does not follow a supervisor value" || ok "status failure rollback does not follow a supervisor value"
+rm -f "$T/status-fail"
 
 echo "== web deploy"
 mkdir -p "$EVE_ROOT/previous"; chmod 555 "$EVE_ROOT"   # like production: the deploy user can not rename entries of $EVE_ROOT itself

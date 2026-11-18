@@ -38,12 +38,12 @@ The workflow chain runs on `push` to `main` only, so a pull request (including f
 
 ## One-time setup (admin)
 1. Create this repository (public, like the other two: it holds no secrets) and push `main`.
-2. On the host, as root: `EVE_RUN_USER=<login-account> bash host/setup.sh` (asks for one runner registration token per repository: Settings -> Actions -> Runners -> New self-hosted runner). `EVE_RUN_USER` is required. The script exits with a clear error when it is unset, when that account does not exist, when it is in the admin group, and when it is root or uid 0 (`id -u`). It also creates `/opt/eve-gw/deploy` (supervisor `release_root`) and `/opt/eve-gw/run` (control socket directory, mode 0700).
+2. On the host, as root: `EVE_RUN_USER=<login-account> bash host/setup.sh` (asks for one runner registration token per repository: Settings -> Actions -> Runners -> New self-hosted runner). `EVE_RUN_USER` is required. The login account may be an admin. The script exits with a clear error when it is unset, when that account does not exist, and when it is root or uid 0 (`id -u`). It also creates `/opt/eve-gw/deploy` (supervisor `release_root`) and `/opt/eve-gw/run` (control socket directory, mode 0700).
 3. In `eve-serving` and `eve-web` rulesets: let GitHub Actions create tags (ruleset `release-tags`: add the GitHub Actions app to the bypass list).
 4. Cutover: set the repository variable `AUTO_RELEASE=on` in each repository. Until then the workflow does nothing and the old pipeline stays in charge.
 5. After two successful real deploys, remove the old pipeline (host privilege entry, Sigstore workflows, poller) in one reviewed PR.
 
-Directory handoff, run from this checkout, takes the account only from `EVE_RUN_USER`. EVE_RUN_USER is required. It calls `host/setup.sh --check-run-user` (the same `eve_check_run_user` check as setup) and exits with a clear error when that variable is unset, when the account does not exist, when the account is in the admin group, or when the account is root or uid 0 (`id -u`):
+Directory handoff, run from this checkout, takes the account only from `EVE_RUN_USER`. EVE_RUN_USER is required. It calls `host/setup.sh --check-run-user` (the same `eve_check_run_user` check as setup). The login account may be an admin. The check exits with a clear error when that variable is unset, when the account does not exist, or when the account is root or uid 0 (`id -u`):
 
 ```bash
 bash host/setup.sh --check-run-user || exit 1; sudo launchctl bootout system/com.eve.restart-watcher || true; sudo rm -f /Library/LaunchDaemons/com.eve.restart-watcher.plist /usr/local/libexec/eve-restart-watcher /opt/eve-gw/restart.trigger; sudo launchctl bootout system/com.llmserving.gateway || true; sudo install -d -o "$EVE_RUN_USER" -m 0700 /opt/eve-gw/deploy /opt/eve-gw/run; sudo chown "$EVE_RUN_USER" /opt/eve-gw/deploy /opt/eve-gw/run; sudo chmod 0700 /opt/eve-gw/deploy /opt/eve-gw/run
@@ -57,5 +57,6 @@ The server is moving to a single login-user account (LaunchAgent); the actual cu
 - The socket directory must be mode `0700`, owned by the deploy user, and not a symlink. The socket file itself is mode `0600`. eve-deploy refuses anything else.
 - Health, `/_deploy/version`, and automatic rollback belong to eve-supervisor. `result.json` keeps the old summary: `success`, `unchanged`, `rolled-back` (`health` `restored` or `restore-failed`), or `failed`.
 - `deploy rollback gateway` sends `{"command":"rollback","child":"<name>"}`. Web deploys still swap files and poll `EVE_UI_URL`.
+- State files live in `EVE_STATE_DIR` (default `$EVE_ROOT/state`). When the gateway version file is empty, deploy uses the supervisor's current version as the previous one. Rollback follows the supervisor's previous version when that differs from the state file. If the supervisor status read fails, deploy keeps the state file and continues.
 - The gateway migrates its own database at start (`GW_DB_AUTO_MIGRATE=true` in `deploy/launchd-go/gateway.plist.template` for installs that still use that template). The deploy account has no database credentials; a rollback is the previous binary (migrations are forward-only and expand-only).
 - `manifest.json` is optional: if the release has one, component and version must match.
