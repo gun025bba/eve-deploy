@@ -3,7 +3,8 @@
 #   sudo EVE_RUN_USER=<login-account> bash host/setup.sh
 # EVE_RUN_USER is required. The script exits with a clear error when it is unset.
 # It refuses a missing account, root, and any account whose uid is 0.
-# The login account may be an admin.
+# EVE_LOGIN_USER names the configured login account. Without that setting the check refuses.
+# An admin account passes only when it is that same account.
 #   EVE_RUN_USER=<login-account> bash host/setup.sh --check-run-user
 # checks the account and does nothing else. The cutover one-liner uses that.
 # Everything after this is automatic: a merge into main -> GitHub Actions -> this host's runner -> bin/deploy.
@@ -16,10 +17,14 @@
 # They are read from the terminal (or from RUNNER_TOKEN_EVE_SERVING / RUNNER_TOKEN_EVE_WEB) and never written to disk.
 set -euo pipefail
 
-eve_check_run_user() { # $1 account. Exists, and is not root or uid 0. An admin login account is accepted.
+eve_check_run_user() { # $1 account. Exists, is not root or uid 0. An admin passes only as EVE_LOGIN_USER.
   local user=${1:-}
   if [ -z "$user" ]; then
     echo "EVE_RUN_USER is required: set it to the login account that owns the deploy directories and the runner." >&2
+    return 1
+  fi
+  if [ -z "${EVE_LOGIN_USER:-}" ]; then
+    echo "EVE_LOGIN_USER is required: set it to the configured login account. Refusing without that setting." >&2
     return 1
   fi
   if ! id "$user" >/dev/null 2>&1; then
@@ -29,6 +34,12 @@ eve_check_run_user() { # $1 account. Exists, and is not root or uid 0. An admin 
   if [ "$user" = root ] || [ "$(id -u "$user")" = 0 ]; then
     echo "refusing: $user is root (uid 0). The runner must not be root." >&2
     return 1
+  fi
+  if dscl . -read /Groups/admin GroupMembership 2>/dev/null | tr ' ' '\n' | grep -qx "$user"; then
+    if [ "$user" != "$EVE_LOGIN_USER" ]; then
+      echo "refusing: $user is an admin account and is not the configured login account." >&2
+      return 1
+    fi
   fi
   return 0
 }
