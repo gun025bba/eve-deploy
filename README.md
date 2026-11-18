@@ -38,15 +38,15 @@ The workflow chain runs on `push` to `main` only, so a pull request (including f
 
 ## One-time setup (admin)
 1. Create this repository (public, like the other two: it holds no secrets) and push `main`.
-2. On the host, as root: `EVE_RUN_USER=<login-account> bash host/setup.sh` (asks for one runner registration token per repository: Settings -> Actions -> Runners -> New self-hosted runner). `EVE_RUN_USER` is required. The script exits with a clear error when it is unset, and it refuses root and any account whose uid is 0. It also creates `/opt/eve-gw/deploy` (supervisor `release_root`) and `/opt/eve-gw/run` (control socket directory, mode 0700).
+2. On the host, as root: `EVE_RUN_USER=<login-account> bash host/setup.sh` (asks for one runner registration token per repository: Settings -> Actions -> Runners -> New self-hosted runner). `EVE_RUN_USER` is required. The script exits with a clear error when it is unset, when that account does not exist, when it is in the admin group, and when it is root or uid 0 (`id -u`). It also creates `/opt/eve-gw/deploy` (supervisor `release_root`) and `/opt/eve-gw/run` (control socket directory, mode 0700).
 3. In `eve-serving` and `eve-web` rulesets: let GitHub Actions create tags (ruleset `release-tags`: add the GitHub Actions app to the bypass list).
 4. Cutover: set the repository variable `AUTO_RELEASE=on` in each repository. Until then the workflow does nothing and the old pipeline stays in charge.
 5. After two successful real deploys, remove the old pipeline (host privilege entry, Sigstore workflows, poller) in one reviewed PR.
 
-Directory handoff, when an operator runs it by hand, takes the account only from `EVE_RUN_USER`. It exits with a clear error when that variable is unset, and it refuses root and any account whose uid is 0:
+Directory handoff, run from this checkout, takes the account only from `EVE_RUN_USER`. EVE_RUN_USER is required. It calls `host/setup.sh --check-run-user` (the same `eve_check_run_user` check as setup) and exits with a clear error when that variable is unset, when the account does not exist, when the account is in the admin group, or when the account is root or uid 0 (`id -u`):
 
 ```bash
-[ -n "${EVE_RUN_USER:-}" ] || { echo "EVE_RUN_USER is required: set it to the login account that owns the deploy directories and the runner." >&2; exit 1; }; { [ "$EVE_RUN_USER" != root ] && [ "$(id -u "$EVE_RUN_USER" 2>/dev/null || true)" != 0 ]; } || { echo "refusing: $EVE_RUN_USER is root (uid 0). The runner must not be root." >&2; exit 1; }; sudo launchctl bootout system/com.eve.restart-watcher || true; sudo rm -f /Library/LaunchDaemons/com.eve.restart-watcher.plist /usr/local/libexec/eve-restart-watcher /opt/eve-gw/restart.trigger; sudo launchctl bootout system/com.llmserving.gateway || true; sudo install -d -o "$EVE_RUN_USER" -m 0700 /opt/eve-gw/deploy /opt/eve-gw/run; sudo chown "$EVE_RUN_USER" /opt/eve-gw/deploy /opt/eve-gw/run; sudo chmod 0700 /opt/eve-gw/deploy /opt/eve-gw/run
+bash host/setup.sh --check-run-user || exit 1; sudo launchctl bootout system/com.eve.restart-watcher || true; sudo rm -f /Library/LaunchDaemons/com.eve.restart-watcher.plist /usr/local/libexec/eve-restart-watcher /opt/eve-gw/restart.trigger; sudo launchctl bootout system/com.llmserving.gateway || true; sudo install -d -o "$EVE_RUN_USER" -m 0700 /opt/eve-gw/deploy /opt/eve-gw/run; sudo chown "$EVE_RUN_USER" /opt/eve-gw/deploy /opt/eve-gw/run; sudo chmod 0700 /opt/eve-gw/deploy /opt/eve-gw/run
 ```
 
 The server is moving to a single login-user account (LaunchAgent); the actual cutover is a separate runbook script.
