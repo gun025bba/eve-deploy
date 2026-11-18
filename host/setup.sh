@@ -1,5 +1,7 @@
 #!/bin/bash
-# One-time host setup for tag-driven deploys. Run ONCE by an admin:   sudo bash host/setup.sh
+# One-time host setup for tag-driven deploys. Run ONCE by an admin:
+#   sudo EVE_RUN_USER=<login-account> bash host/setup.sh
+# EVE_RUN_USER is required. The script exits with a clear error when it is unset.
 # Everything after this is automatic: a merge into main -> GitHub Actions -> this host's runner -> bin/deploy.
 #
 # What it does (nothing else; it does not touch config, data, secrets or a running supervisor):
@@ -11,14 +13,18 @@
 set -euo pipefail
 
 EVE_ROOT=${EVE_ROOT:-/opt/eve-gw}
-RUNNER_USER=${RUNNER_USER:-evedeploy}
+if [ -z "${EVE_RUN_USER:-}" ]; then
+  echo "EVE_RUN_USER is required: set it to the login account that owns the deploy directories and the runner." >&2
+  exit 1
+fi
+RUNNER_USER=$EVE_RUN_USER
 OWNER=${EVE_OWNER:-gun025bba}
 RUNNER_VERSION=2.338.2
 RUNNER_ASSET=actions-runner-osx-arm64-$RUNNER_VERSION.tar.gz
 RUNNER_SHA256=25a065af409ffa317ab4d5a3b614dd15fc9c40f2172bc1b35a1b1258e919a388   # pinned: the download is refused if it differs
 HERE=$(cd "$(dirname "$0")" && pwd)
 
-[ "$(id -u)" = 0 ] || { echo "run with sudo: sudo bash host/setup.sh" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || { echo "run with sudo: sudo EVE_RUN_USER=<login-account> bash host/setup.sh" >&2; exit 1; }
 [ "$(uname -s)" = Darwin ] || { echo "this script is for the macOS host" >&2; exit 1; }
 id "$RUNNER_USER" >/dev/null 2>&1 || { echo "account $RUNNER_USER does not exist" >&2; exit 1; }
 if dscl . -read /Groups/admin GroupMembership 2>/dev/null | tr ' ' '\n' | grep -qx "$RUNNER_USER"; then

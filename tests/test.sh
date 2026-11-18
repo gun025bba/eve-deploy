@@ -181,6 +181,21 @@ check "restore failure: state unchanged" "$(cat "$EVE_ROOT/state/gateway.version
 # the production plist template turns on startup migrations (BE decision, C5). setup no longer edits a gateway daemon.
 grep -q '<key>GW_DB_AUTO_MIGRATE</key><string>true</string>' "$R/deploy/launchd-go/gateway.plist.template" && ok "plist template sets GW_DB_AUTO_MIGRATE=true" || bad "plist template sets GW_DB_AUTO_MIGRATE=true"
 if grep -q 'restart-watcher\|com.llmserving.gateway' "$R/host/setup.sh"; then bad "setup still installs the watcher or gateway daemon"; else ok "setup does not install the watcher or gateway daemon"; fi
+if grep -q 'evedeploy' "$R/host/setup.sh" "$R/README.md"; then bad "setup and README name no default account"; else ok "setup and README name no default account"; fi
+OUT=$(env -u EVE_RUN_USER bash "$R/host/setup.sh" 2>&1)
+check "setup without EVE_RUN_USER exits 1" "$?" 1
+echo "$OUT" | grep -q 'EVE_RUN_USER is required' && ok "setup without EVE_RUN_USER says it is required" || bad "setup without EVE_RUN_USER says it is required"
+OUT=$(env -u EVE_RUN_USER RUNNER_USER=somebody bash "$R/host/setup.sh" 2>&1)
+check "RUNNER_USER alone is not the run account" "$?" 1
+grep -q 'EVE_RUN_USER is required' "$R/README.md" && ok "README cutover one-liner requires EVE_RUN_USER" || bad "README cutover one-liner requires EVE_RUN_USER"
+grep -q 'single login-user account (LaunchAgent); the actual cutover is a separate runbook script' "$R/README.md" && ok "README records the LaunchAgent move and separate runbook" || bad "README records the LaunchAgent move and separate runbook"
+awk '/^```bash$/{p=1;next} /^```$/{if(p) exit} p' "$R/README.md" >"$T/cutover.sh"
+OUT=$(env -u EVE_RUN_USER bash "$T/cutover.sh" 2>&1)
+check "cutover one-liner without EVE_RUN_USER exits 1" "$?" 1
+echo "$OUT" | grep -q 'EVE_RUN_USER is required' && ok "cutover one-liner says EVE_RUN_USER is required" || bad "cutover one-liner says EVE_RUN_USER is required"
+OUT=$(env EVE_RUN_USER=login-account bash -c 'sudo() { printf "sudo %s\n" "$*"; }; . "$1"' _ "$T/cutover.sh" 2>&1)
+echo "$OUT" | grep -q 'install -d -o login-account ' && ok "cutover one-liner passes EVE_RUN_USER to install" || bad "cutover one-liner passes EVE_RUN_USER to install"
+echo "$OUT" | grep -q 'chown login-account ' && ok "cutover one-liner passes EVE_RUN_USER to chown" || bad "cutover one-liner passes EVE_RUN_USER to chown"
 # a socket directory other people can enter is refused (#265)
 chmod 755 "$(dirname "$EVE_CONTROL_SOCKET")"
 BEFORE=$(wc -l <"$T/sock.log" | tr -d ' ')
@@ -273,7 +288,8 @@ check "index.html and sw.js leave first" "$(grep " $E/previous/web/\$" "$T/mvlog
 check "index.html then sw.js come back last" "$INS" "index.html sw.js "
 chmod 755 "$EVE_ROOT"
 check "no sudo anywhere in the scripts" "$(cat "$R"/bin/* | sed 's/#.*//' | grep -c '\bsudo\b')" 0
-HITS=$(grep -R -n -E 'sudo|LaunchDaemon|restart-watcher' "$R" --exclude-dir=.git --exclude-dir=ci-vm --exclude=setup.sh --exclude=guard-install.sh --exclude=test.sh || true)
+# README.md documents the handoff one-liner. It is not installed; the cutover itself is a separate runbook.
+HITS=$(grep -R -n -E 'sudo|LaunchDaemon|restart-watcher' "$R" --exclude-dir=.git --exclude-dir=ci-vm --exclude=setup.sh --exclude=guard-install.sh --exclude=test.sh --exclude=README.md || true)
 if [ -n "$HITS" ]; then bad "sudo, LaunchDaemon, or restart-watcher outside runner install"; printf '%s\n' "$HITS"; else ok "no sudo, LaunchDaemon, or restart-watcher outside runner install"; fi
 
 echo "== next-version"
