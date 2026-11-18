@@ -2,21 +2,20 @@
 # One-time host setup for tag-driven deploys. Run ONCE by an admin:
 #   sudo EVE_RUN_USER=<login-account> bash host/setup.sh
 # EVE_RUN_USER is required. The script exits with a clear error when it is unset.
-# It refuses a missing account, root, and any account whose uid is 0.
-# The login account may be an admin.
+# It refuses a missing account, an admin account, root, and any account whose uid is 0.
 #   EVE_RUN_USER=<login-account> bash host/setup.sh --check-run-user
 # checks the account and does nothing else. The cutover one-liner uses that.
 # Everything after this is automatic: a merge into main -> GitHub Actions -> this host's runner -> bin/deploy.
 #
 # What it does (nothing else; it does not touch config, data, secrets or a running supervisor):
 #   1. makes the runner account own the code directories under /opt/eve-gw, plus the supervisor release root and socket directory
-#   2. installs one self-hosted runner per repo (label "eve-host"), running as the login account, outbound HTTPS only
+#   2. installs one self-hosted runner per repo (label "eve-host"), running as the non-admin account, outbound HTTPS only
 #
 # Runner registration tokens come from GitHub (repo -> Settings -> Actions -> Runners -> New self-hosted runner), valid 1 hour.
 # They are read from the terminal (or from RUNNER_TOKEN_EVE_SERVING / RUNNER_TOKEN_EVE_WEB) and never written to disk.
 set -euo pipefail
 
-eve_check_run_user() { # $1 account. Exists, and is not root or uid 0. An admin login account is accepted.
+eve_check_run_user() { # $1 account. Exists, is not admin, and is not root or uid 0.
   local user=${1:-}
   if [ -z "$user" ]; then
     echo "EVE_RUN_USER is required: set it to the login account that owns the deploy directories and the runner." >&2
@@ -28,6 +27,10 @@ eve_check_run_user() { # $1 account. Exists, and is not root or uid 0. An admin 
   fi
   if [ "$user" = root ] || [ "$(id -u "$user")" = 0 ]; then
     echo "refusing: $user is root (uid 0). The runner must not be root." >&2
+    return 1
+  fi
+  if dscl . -read /Groups/admin GroupMembership 2>/dev/null | tr ' ' '\n' | grep -qx "$user"; then
+    echo "refusing: $user is an admin account. The runner must not be admin." >&2
     return 1
   fi
   return 0

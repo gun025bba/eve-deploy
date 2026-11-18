@@ -212,7 +212,11 @@ case "$user" in
 esac
 exit 1
 SH
-chmod +x "$T/idbin/id"
+cat >"$T/idbin/dscl" <<'SH'
+#!/bin/bash
+printf '%s\n' "${DSCL_MEMBERSHIP:-GroupMembership: root admin}"
+SH
+chmod +x "$T/idbin/id" "$T/idbin/dscl"
 OUT=$(PATH="$T/idbin:$PATH" run_cutover EVE_RUN_USER=login-account)
 echo "$OUT" | grep -q 'install -d -o login-account ' && ok "cutover one-liner passes EVE_RUN_USER to install" || bad "cutover one-liner passes EVE_RUN_USER to install"
 echo "$OUT" | grep -q 'chown login-account ' && ok "cutover one-liner passes EVE_RUN_USER to chown" || bad "cutover one-liner passes EVE_RUN_USER to chown"
@@ -237,12 +241,13 @@ OUT=$(run_cutover EVE_RUN_USER=eve-no-such-account)
 check "cutover one-liner refuses a missing account" "$?" 1
 echo "$OUT" | grep -q 'account eve-no-such-account does not exist' && ok "cutover one-liner says the account does not exist" || bad "cutover one-liner says the account does not exist"
 echo "$OUT" | grep -q 'install -d' && bad "cutover one-liner stops before install for a missing account" || ok "cutover one-liner stops before install for a missing account"
-OUT=$(PATH="$T/idbin:$PATH" env EVE_RUN_USER=adminuser bash "$R/host/setup.sh" --check-run-user 2>&1)
-check "setup allows an admin login account" "$?" 0
-echo "$OUT" | grep -q 'is an admin account' && bad "setup does not reject an admin login account" || ok "setup does not reject an admin login account"
-OUT=$(PATH="$T/idbin:$PATH" run_cutover EVE_RUN_USER=adminuser)
-echo "$OUT" | grep -q 'install -d -o adminuser ' && ok "cutover one-liner allows an admin login account" || bad "cutover one-liner allows an admin login account"
-echo "$OUT" | grep -q 'is an admin account' && bad "cutover one-liner does not reject an admin login account" || ok "cutover one-liner does not reject an admin login account"
+OUT=$(PATH="$T/idbin:$PATH" DSCL_MEMBERSHIP='GroupMembership: root admin adminuser' env EVE_RUN_USER=adminuser bash "$R/host/setup.sh" 2>&1)
+check "setup refuses an admin account" "$?" 1
+echo "$OUT" | grep -q 'refusing: adminuser is an admin account' && ok "setup says the admin account is refused" || bad "setup says the admin account is refused"
+OUT=$(PATH="$T/idbin:$PATH" DSCL_MEMBERSHIP='GroupMembership: root admin adminuser' run_cutover EVE_RUN_USER=adminuser)
+check "cutover one-liner refuses an admin account" "$?" 1
+echo "$OUT" | grep -q 'refusing: adminuser is an admin account' && ok "cutover one-liner says the admin account is refused" || bad "cutover one-liner says the admin account is refused"
+echo "$OUT" | grep -q 'install -d' && bad "cutover one-liner stops before install for an admin" || ok "cutover one-liner stops before install for an admin"
 # a socket directory other people can enter is refused (#265)
 chmod 755 "$(dirname "$EVE_CONTROL_SOCKET")"
 BEFORE=$(wc -l <"$T/sock.log" | tr -d ' ')
