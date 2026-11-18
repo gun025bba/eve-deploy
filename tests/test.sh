@@ -203,6 +203,8 @@ echo "$OUT" | grep -q 'EVE_RUN_USER is required' && ok "cutover one-liner says E
 mkdir -p "$T/idbin"
 cat >"$T/idbin/id" <<'SH'
 #!/bin/bash
+if [ "$1" = -un ]; then printf '%s\n' "${MOCK_ID_NAME:-login-account}"; exit 0; fi
+if [ "$1" = -u ] && [ -z "${2:-}" ]; then printf '%s\n' "${MOCK_ID_UID:-501}"; exit 0; fi
 user=$1
 if [ "$1" = -u ]; then user=$2; fi
 case "$user" in
@@ -217,47 +219,58 @@ cat >"$T/idbin/dscl" <<'SH'
 #!/bin/bash
 printf '%s\n' "${DSCL_MEMBERSHIP:-GroupMembership: root admin}"
 SH
-chmod +x "$T/idbin/id" "$T/idbin/dscl"
-OUT=$(PATH="$T/idbin:$PATH" run_cutover EVE_LOGIN_USER=login-account EVE_RUN_USER=login-account)
+cat >"$T/idbin/stat" <<'SH'
+#!/bin/bash
+if [ "${MOCK_CONSOLE_UNSET:-}" = 1 ]; then exit 0; fi
+if [ -n "${MOCK_CONSOLE_USER:-}" ]; then printf '%s\n' "$MOCK_CONSOLE_USER"; fi
+exit 0
+SH
+chmod +x "$T/idbin/id" "$T/idbin/dscl" "$T/idbin/stat"
+OUT=$(PATH="$T/idbin:$PATH" run_cutover EVE_RUN_USER=login-account)
 echo "$OUT" | grep -q 'install -d -o login-account ' && ok "cutover one-liner passes EVE_RUN_USER to install" || bad "cutover one-liner passes EVE_RUN_USER to install"
 echo "$OUT" | grep -q 'chown login-account ' && ok "cutover one-liner passes EVE_RUN_USER to chown" || bad "cutover one-liner passes EVE_RUN_USER to chown"
-OUT=$(env EVE_LOGIN_USER=login-account EVE_RUN_USER=root bash "$R/host/setup.sh" 2>&1)
+OUT=$(env EVE_RUN_USER=root bash "$R/host/setup.sh" 2>&1)
 check "setup refuses the name root" "$?" 1
 echo "$OUT" | grep -q 'refusing: root is root (uid 0)' && ok "setup says root is refused" || bad "setup says root is refused"
-OUT=$(run_cutover EVE_LOGIN_USER=login-account EVE_RUN_USER=root)
+OUT=$(run_cutover EVE_RUN_USER=root)
 check "cutover one-liner refuses the name root" "$?" 1
 echo "$OUT" | grep -q 'refusing: root is root (uid 0)' && ok "cutover one-liner says root is refused" || bad "cutover one-liner says root is refused"
 echo "$OUT" | grep -q 'install -d' && bad "cutover one-liner stops before install for root" || ok "cutover one-liner stops before install for root"
-OUT=$(PATH="$T/idbin:$PATH" env EVE_LOGIN_USER=login-account EVE_RUN_USER=toor bash "$R/host/setup.sh" 2>&1)
+OUT=$(PATH="$T/idbin:$PATH" env EVE_RUN_USER=toor bash "$R/host/setup.sh" 2>&1)
 check "setup refuses uid 0 under another name" "$?" 1
 echo "$OUT" | grep -q 'refusing: toor is root (uid 0)' && ok "setup says the uid 0 account is refused" || bad "setup says the uid 0 account is refused"
-OUT=$(PATH="$T/idbin:$PATH" run_cutover EVE_LOGIN_USER=login-account EVE_RUN_USER=toor)
+OUT=$(PATH="$T/idbin:$PATH" run_cutover EVE_RUN_USER=toor)
 check "cutover one-liner refuses uid 0 under another name" "$?" 1
 echo "$OUT" | grep -q 'refusing: toor is root (uid 0)' && ok "cutover one-liner says the uid 0 account is refused" || bad "cutover one-liner says the uid 0 account is refused"
 echo "$OUT" | grep -q 'install -d' && bad "cutover one-liner stops before install for uid 0" || ok "cutover one-liner stops before install for uid 0"
-OUT=$(env EVE_LOGIN_USER=login-account EVE_RUN_USER=eve-no-such-account bash "$R/host/setup.sh" 2>&1)
+OUT=$(env EVE_RUN_USER=eve-no-such-account bash "$R/host/setup.sh" 2>&1)
 check "setup refuses a missing account" "$?" 1
 echo "$OUT" | grep -q 'account eve-no-such-account does not exist' && ok "setup says the account does not exist" || bad "setup says the account does not exist"
-OUT=$(run_cutover EVE_LOGIN_USER=login-account EVE_RUN_USER=eve-no-such-account)
+OUT=$(run_cutover EVE_RUN_USER=eve-no-such-account)
 check "cutover one-liner refuses a missing account" "$?" 1
 echo "$OUT" | grep -q 'account eve-no-such-account does not exist' && ok "cutover one-liner says the account does not exist" || bad "cutover one-liner says the account does not exist"
 echo "$OUT" | grep -q 'install -d' && bad "cutover one-liner stops before install for a missing account" || ok "cutover one-liner stops before install for a missing account"
-OUT=$(PATH="$T/idbin:$PATH" DSCL_MEMBERSHIP='GroupMembership: root admin adminuser' env EVE_LOGIN_USER=adminuser EVE_RUN_USER=adminuser bash "$R/host/setup.sh" --check-run-user 2>&1)
-check "setup allows the configured admin login account" "$?" 0
-OUT=$(PATH="$T/idbin:$PATH" DSCL_MEMBERSHIP='GroupMembership: root admin adminuser' run_cutover EVE_LOGIN_USER=adminuser EVE_RUN_USER=adminuser)
-echo "$OUT" | grep -q 'install -d -o adminuser ' && ok "cutover one-liner allows the configured admin login account" || bad "cutover one-liner allows the configured admin login account"
-OUT=$(PATH="$T/idbin:$PATH" DSCL_MEMBERSHIP='GroupMembership: root admin other-admin' env EVE_LOGIN_USER=login-account EVE_RUN_USER=other-admin bash "$R/host/setup.sh" --check-run-user 2>&1)
-check "setup refuses an admin account that is not the configured login account" "$?" 1
-echo "$OUT" | grep -q 'refusing: other-admin is an admin account and is not the configured login account' && ok "setup says the other admin is refused" || bad "setup says the other admin is refused"
-OUT=$(PATH="$T/idbin:$PATH" DSCL_MEMBERSHIP='GroupMembership: root admin other-admin' run_cutover EVE_LOGIN_USER=login-account EVE_RUN_USER=other-admin)
-check "cutover one-liner refuses an admin account that is not the configured login account" "$?" 1
+OUT=$(PATH="$T/idbin:$PATH" DSCL_MEMBERSHIP='GroupMembership: root admin adminuser' env MOCK_ID_UID=501 MOCK_ID_NAME=adminuser EVE_RUN_USER=adminuser bash "$R/host/setup.sh" --check-run-user 2>&1)
+check "setup allows an admin account that is the current user" "$?" 0
+OUT=$(PATH="$T/idbin:$PATH" DSCL_MEMBERSHIP='GroupMembership: root admin adminuser' run_cutover MOCK_ID_UID=501 MOCK_ID_NAME=adminuser EVE_RUN_USER=adminuser)
+echo "$OUT" | grep -q 'install -d -o adminuser ' && ok "cutover one-liner allows an admin account that is the current user" || bad "cutover one-liner allows an admin account that is the current user"
+OUT=$(PATH="$T/idbin:$PATH" DSCL_MEMBERSHIP='GroupMembership: root admin other-admin' env MOCK_ID_UID=501 MOCK_ID_NAME=login-account EVE_RUN_USER=other-admin bash "$R/host/setup.sh" --check-run-user 2>&1)
+check "setup refuses an admin account that is not the current user" "$?" 1
+echo "$OUT" | grep -q 'refusing: other-admin is an admin account and is not the current user' && ok "setup says the other admin is not the current user" || bad "setup says the other admin is not the current user"
+OUT=$(PATH="$T/idbin:$PATH" DSCL_MEMBERSHIP='GroupMembership: root admin other-admin' run_cutover MOCK_ID_UID=501 MOCK_ID_NAME=login-account EVE_RUN_USER=other-admin)
+check "cutover one-liner refuses an admin account that is not the current user" "$?" 1
 echo "$OUT" | grep -q 'install -d' && bad "cutover one-liner stops before install for another admin" || ok "cutover one-liner stops before install for another admin"
-OUT=$(PATH="$T/idbin:$PATH" env -u EVE_LOGIN_USER EVE_RUN_USER=login-account bash "$R/host/setup.sh" --check-run-user 2>&1)
-check "setup refuses when the login account setting is missing" "$?" 1
-echo "$OUT" | grep -q 'EVE_LOGIN_USER is required' && ok "setup says the login account setting is required" || bad "setup says the login account setting is required"
-OUT=$(PATH="$T/idbin:$PATH" run_cutover -u EVE_LOGIN_USER EVE_RUN_USER=login-account)
-check "cutover one-liner refuses when the login account setting is missing" "$?" 1
-echo "$OUT" | grep -q 'install -d' && bad "cutover one-liner stops before install when the setting is missing" || ok "cutover one-liner stops before install when the setting is missing"
+OUT=$(PATH="$T/idbin:$PATH" DSCL_MEMBERSHIP='GroupMembership: root admin adminuser' env -u SUDO_USER MOCK_ID_UID=0 MOCK_CONSOLE_USER=adminuser SUDO_USER=adminuser EVE_RUN_USER=adminuser bash "$R/host/setup.sh" --check-run-user 2>&1)
+check "sudo setup allows an admin account that matches SUDO_USER and the console user" "$?" 0
+OUT=$(PATH="$T/idbin:$PATH" DSCL_MEMBERSHIP='GroupMembership: root admin other-admin' env -u SUDO_USER MOCK_ID_UID=0 MOCK_CONSOLE_USER=login-account SUDO_USER=login-account EVE_RUN_USER=other-admin bash "$R/host/setup.sh" --check-run-user 2>&1)
+check "sudo setup refuses an admin account that is not SUDO_USER" "$?" 1
+echo "$OUT" | grep -q 'is not the sudo user' && ok "sudo setup says the admin is not the sudo user" || bad "sudo setup says the admin is not the sudo user"
+OUT=$(PATH="$T/idbin:$PATH" DSCL_MEMBERSHIP='GroupMembership: root admin adminuser' env -u SUDO_USER MOCK_ID_UID=0 MOCK_CONSOLE_USER=login-account SUDO_USER=adminuser EVE_RUN_USER=adminuser bash "$R/host/setup.sh" --check-run-user 2>&1)
+check "sudo setup refuses an admin account that is not the console user" "$?" 1
+echo "$OUT" | grep -q 'is not the console login account' && ok "sudo setup says the admin is not the console user" || bad "sudo setup says the admin is not the console user"
+OUT=$(PATH="$T/idbin:$PATH" DSCL_MEMBERSHIP='GroupMembership: root admin adminuser' env -u SUDO_USER MOCK_ID_UID=0 MOCK_CONSOLE_UNSET=1 EVE_RUN_USER=adminuser bash "$R/host/setup.sh" --check-run-user 2>&1)
+check "sudo setup refuses an admin account when both identities are unknown" "$?" 1
+echo "$OUT" | grep -q 'both unknown' && ok "sudo setup says both identities are unknown" || bad "sudo setup says both identities are unknown"
 # a socket directory other people can enter is refused (#265)
 chmod 755 "$(dirname "$EVE_CONTROL_SOCKET")"
 BEFORE=$(wc -l <"$T/sock.log" | tr -d ' ')
