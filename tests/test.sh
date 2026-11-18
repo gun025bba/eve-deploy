@@ -196,6 +196,28 @@ echo "$OUT" | grep -q 'EVE_RUN_USER is required' && ok "cutover one-liner says E
 OUT=$(env EVE_RUN_USER=login-account bash -c 'sudo() { printf "sudo %s\n" "$*"; }; . "$1"' _ "$T/cutover.sh" 2>&1)
 echo "$OUT" | grep -q 'install -d -o login-account ' && ok "cutover one-liner passes EVE_RUN_USER to install" || bad "cutover one-liner passes EVE_RUN_USER to install"
 echo "$OUT" | grep -q 'chown login-account ' && ok "cutover one-liner passes EVE_RUN_USER to chown" || bad "cutover one-liner passes EVE_RUN_USER to chown"
+grep -q 'is root (uid 0)' "$R/host/setup.sh" && grep -q 'is root (uid 0)' "$R/README.md" && ok "setup and the one-liner share the root guard" || bad "setup and the one-liner share the root guard"
+OUT=$(env EVE_RUN_USER=root bash "$R/host/setup.sh" 2>&1)
+check "setup refuses the name root" "$?" 1
+echo "$OUT" | grep -q 'refusing: root is root (uid 0)' && ok "setup says root is refused" || bad "setup says root is refused"
+OUT=$(env EVE_RUN_USER=root bash "$T/cutover.sh" 2>&1)
+check "cutover one-liner refuses the name root" "$?" 1
+echo "$OUT" | grep -q 'refusing: root is root (uid 0)' && ok "cutover one-liner says root is refused" || bad "cutover one-liner says root is refused"
+echo "$OUT" | grep -q 'install -d' && bad "cutover one-liner stops before install for root" || ok "cutover one-liner stops before install for root"
+mkdir -p "$T/idbin"
+cat >"$T/idbin/id" <<'SH'
+#!/bin/bash
+if [ "$1" = -u ] && [ "$2" = toor ]; then echo 0; exit 0; fi
+exit 1
+SH
+chmod +x "$T/idbin/id"
+OUT=$(PATH="$T/idbin:$PATH" env EVE_RUN_USER=toor bash "$R/host/setup.sh" 2>&1)
+check "setup refuses uid 0 under another name" "$?" 1
+echo "$OUT" | grep -q 'refusing: toor is root (uid 0)' && ok "setup says the uid 0 account is refused" || bad "setup says the uid 0 account is refused"
+OUT=$(PATH="$T/idbin:$PATH" env EVE_RUN_USER=toor bash "$T/cutover.sh" 2>&1)
+check "cutover one-liner refuses uid 0 under another name" "$?" 1
+echo "$OUT" | grep -q 'refusing: toor is root (uid 0)' && ok "cutover one-liner says the uid 0 account is refused" || bad "cutover one-liner says the uid 0 account is refused"
+echo "$OUT" | grep -q 'install -d' && bad "cutover one-liner stops before install for uid 0" || ok "cutover one-liner stops before install for uid 0"
 # a socket directory other people can enter is refused (#265)
 chmod 755 "$(dirname "$EVE_CONTROL_SOCKET")"
 BEFORE=$(wc -l <"$T/sock.log" | tr -d ' ')

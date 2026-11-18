@@ -1,7 +1,8 @@
 #!/bin/bash
 # One-time host setup for tag-driven deploys. Run ONCE by an admin:
 #   sudo EVE_RUN_USER=<login-account> bash host/setup.sh
-# EVE_RUN_USER is required. The script exits with a clear error when it is unset.
+# EVE_RUN_USER is required. The script exits with a clear error when it is unset,
+# and it refuses root and any account whose uid is 0.
 # Everything after this is automatic: a merge into main -> GitHub Actions -> this host's runner -> bin/deploy.
 #
 # What it does (nothing else; it does not touch config, data, secrets or a running supervisor):
@@ -15,6 +16,10 @@ set -euo pipefail
 EVE_ROOT=${EVE_ROOT:-/opt/eve-gw}
 if [ -z "${EVE_RUN_USER:-}" ]; then
   echo "EVE_RUN_USER is required: set it to the login account that owns the deploy directories and the runner." >&2
+  exit 1
+fi
+if [ "$EVE_RUN_USER" = root ] || [ "$(id -u "$EVE_RUN_USER" 2>/dev/null || true)" = 0 ]; then
+  echo "refusing: $EVE_RUN_USER is root (uid 0). The runner must not be root." >&2
   exit 1
 fi
 RUNNER_USER=$EVE_RUN_USER
