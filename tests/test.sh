@@ -181,6 +181,68 @@ check "restore failure: state unchanged" "$(cat "$EVE_ROOT/state/gateway.version
 # the production plist template turns on startup migrations (BE decision, C5). setup no longer edits a gateway daemon.
 grep -q '<key>GW_DB_AUTO_MIGRATE</key><string>true</string>' "$R/deploy/launchd-go/gateway.plist.template" && ok "plist template sets GW_DB_AUTO_MIGRATE=true" || bad "plist template sets GW_DB_AUTO_MIGRATE=true"
 if grep -q 'restart-watcher\|com.llmserving.gateway' "$R/host/setup.sh"; then bad "setup still installs the watcher or gateway daemon"; else ok "setup does not install the watcher or gateway daemon"; fi
+if grep -q 'evedeploy' "$R/host/setup.sh" "$R/README.md"; then bad "setup and README name no default account"; else ok "setup and README name no default account"; fi
+OUT=$(env -u EVE_RUN_USER bash "$R/host/setup.sh" 2>&1)
+check "setup without EVE_RUN_USER exits 1" "$?" 1
+echo "$OUT" | grep -q 'EVE_RUN_USER is required' && ok "setup without EVE_RUN_USER says it is required" || bad "setup without EVE_RUN_USER says it is required"
+OUT=$(env -u EVE_RUN_USER RUNNER_USER=somebody bash "$R/host/setup.sh" 2>&1)
+check "RUNNER_USER alone is not the run account" "$?" 1
+grep -q 'EVE_RUN_USER is required' "$R/README.md" && ok "README cutover one-liner requires EVE_RUN_USER" || bad "README cutover one-liner requires EVE_RUN_USER"
+grep -q 'single login-user account (LaunchAgent); the actual cutover is a separate runbook script' "$R/README.md" && ok "README records the LaunchAgent move and separate runbook" || bad "README records the LaunchAgent move and separate runbook"
+grep -q 'eve_check_run_user' "$R/host/setup.sh" && grep -q 'host/setup.sh --check-run-user' "$R/README.md" && ok "one-liner calls the setup run-user check" || bad "one-liner calls the setup run-user check"
+awk '/^```bash$/{p=1;next} /^```$/{if(p) exit} p' "$R/README.md" >"$T/cutover.sh"
+run_cutover() { ( cd "$R" && env "$@" bash -c 'sudo() { printf "sudo %s\n" "$*"; }; . "$1"' _ "$T/cutover.sh" 2>&1 ); }
+OUT=$(run_cutover -u EVE_RUN_USER)
+check "cutover one-liner without EVE_RUN_USER exits 1" "$?" 1
+echo "$OUT" | grep -q 'EVE_RUN_USER is required' && ok "cutover one-liner says EVE_RUN_USER is required" || bad "cutover one-liner says EVE_RUN_USER is required"
+mkdir -p "$T/idbin"
+cat >"$T/idbin/id" <<'SH'
+#!/bin/bash
+user=$1
+if [ "$1" = -u ]; then user=$2; fi
+case "$user" in
+  login-account) [ "$1" = -u ] && echo 501; exit 0 ;;
+  toor) [ "$1" = -u ] && echo 0; exit 0 ;;
+  adminuser) [ "$1" = -u ] && echo 501; exit 0 ;;
+esac
+exit 1
+SH
+cat >"$T/idbin/dscl" <<'SH'
+#!/bin/bash
+printf '%s\n' "${DSCL_MEMBERSHIP:-GroupMembership: root admin}"
+SH
+chmod +x "$T/idbin/id" "$T/idbin/dscl"
+OUT=$(PATH="$T/idbin:$PATH" run_cutover EVE_RUN_USER=login-account)
+echo "$OUT" | grep -q 'install -d -o login-account ' && ok "cutover one-liner passes EVE_RUN_USER to install" || bad "cutover one-liner passes EVE_RUN_USER to install"
+echo "$OUT" | grep -q 'chown login-account ' && ok "cutover one-liner passes EVE_RUN_USER to chown" || bad "cutover one-liner passes EVE_RUN_USER to chown"
+OUT=$(env EVE_RUN_USER=root bash "$R/host/setup.sh" 2>&1)
+check "setup refuses the name root" "$?" 1
+echo "$OUT" | grep -q 'refusing: root is root (uid 0)' && ok "setup says root is refused" || bad "setup says root is refused"
+OUT=$(run_cutover EVE_RUN_USER=root)
+check "cutover one-liner refuses the name root" "$?" 1
+echo "$OUT" | grep -q 'refusing: root is root (uid 0)' && ok "cutover one-liner says root is refused" || bad "cutover one-liner says root is refused"
+echo "$OUT" | grep -q 'install -d' && bad "cutover one-liner stops before install for root" || ok "cutover one-liner stops before install for root"
+OUT=$(PATH="$T/idbin:$PATH" env EVE_RUN_USER=toor bash "$R/host/setup.sh" 2>&1)
+check "setup refuses uid 0 under another name" "$?" 1
+echo "$OUT" | grep -q 'refusing: toor is root (uid 0)' && ok "setup says the uid 0 account is refused" || bad "setup says the uid 0 account is refused"
+OUT=$(PATH="$T/idbin:$PATH" run_cutover EVE_RUN_USER=toor)
+check "cutover one-liner refuses uid 0 under another name" "$?" 1
+echo "$OUT" | grep -q 'refusing: toor is root (uid 0)' && ok "cutover one-liner says the uid 0 account is refused" || bad "cutover one-liner says the uid 0 account is refused"
+echo "$OUT" | grep -q 'install -d' && bad "cutover one-liner stops before install for uid 0" || ok "cutover one-liner stops before install for uid 0"
+OUT=$(env EVE_RUN_USER=eve-no-such-account bash "$R/host/setup.sh" 2>&1)
+check "setup refuses a missing account" "$?" 1
+echo "$OUT" | grep -q 'account eve-no-such-account does not exist' && ok "setup says the account does not exist" || bad "setup says the account does not exist"
+OUT=$(run_cutover EVE_RUN_USER=eve-no-such-account)
+check "cutover one-liner refuses a missing account" "$?" 1
+echo "$OUT" | grep -q 'account eve-no-such-account does not exist' && ok "cutover one-liner says the account does not exist" || bad "cutover one-liner says the account does not exist"
+echo "$OUT" | grep -q 'install -d' && bad "cutover one-liner stops before install for a missing account" || ok "cutover one-liner stops before install for a missing account"
+OUT=$(PATH="$T/idbin:$PATH" DSCL_MEMBERSHIP='GroupMembership: root admin adminuser' env EVE_RUN_USER=adminuser bash "$R/host/setup.sh" 2>&1)
+check "setup refuses an admin account" "$?" 1
+echo "$OUT" | grep -q 'refusing: adminuser is an admin account' && ok "setup says the admin account is refused" || bad "setup says the admin account is refused"
+OUT=$(PATH="$T/idbin:$PATH" DSCL_MEMBERSHIP='GroupMembership: root admin adminuser' run_cutover EVE_RUN_USER=adminuser)
+check "cutover one-liner refuses an admin account" "$?" 1
+echo "$OUT" | grep -q 'refusing: adminuser is an admin account' && ok "cutover one-liner says the admin account is refused" || bad "cutover one-liner says the admin account is refused"
+echo "$OUT" | grep -q 'install -d' && bad "cutover one-liner stops before install for an admin" || ok "cutover one-liner stops before install for an admin"
 # a socket directory other people can enter is refused (#265)
 chmod 755 "$(dirname "$EVE_CONTROL_SOCKET")"
 BEFORE=$(wc -l <"$T/sock.log" | tr -d ' ')
@@ -273,7 +335,8 @@ check "index.html and sw.js leave first" "$(grep " $E/previous/web/\$" "$T/mvlog
 check "index.html then sw.js come back last" "$INS" "index.html sw.js "
 chmod 755 "$EVE_ROOT"
 check "no sudo anywhere in the scripts" "$(cat "$R"/bin/* | sed 's/#.*//' | grep -c '\bsudo\b')" 0
-HITS=$(grep -R -n -E 'sudo|LaunchDaemon|restart-watcher' "$R" --exclude-dir=.git --exclude-dir=ci-vm --exclude=setup.sh --exclude=guard-install.sh --exclude=test.sh || true)
+# README.md documents the handoff one-liner. It is not installed; the cutover itself is a separate runbook.
+HITS=$(grep -R -n -E 'sudo|LaunchDaemon|restart-watcher' "$R" --exclude-dir=.git --exclude-dir=ci-vm --exclude=setup.sh --exclude=guard-install.sh --exclude=test.sh --exclude=README.md || true)
 if [ -n "$HITS" ]; then bad "sudo, LaunchDaemon, or restart-watcher outside runner install"; printf '%s\n' "$HITS"; else ok "no sudo, LaunchDaemon, or restart-watcher outside runner install"; fi
 
 echo "== next-version"

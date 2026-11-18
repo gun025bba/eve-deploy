@@ -1,5 +1,10 @@
 #!/bin/bash
-# One-time host setup for tag-driven deploys. Run ONCE by an admin:   sudo bash host/setup.sh
+# One-time host setup for tag-driven deploys. Run ONCE by an admin:
+#   sudo EVE_RUN_USER=<login-account> bash host/setup.sh
+# EVE_RUN_USER is required. The script exits with a clear error when it is unset.
+# It refuses a missing account, an admin account, root, and any account whose uid is 0.
+#   EVE_RUN_USER=<login-account> bash host/setup.sh --check-run-user
+# checks the account and does nothing else. The cutover one-liner uses that.
 # Everything after this is automatic: a merge into main -> GitHub Actions -> this host's runner -> bin/deploy.
 #
 # What it does (nothing else; it does not touch config, data, secrets or a running supervisor):
@@ -10,20 +15,43 @@
 # They are read from the terminal (or from RUNNER_TOKEN_EVE_SERVING / RUNNER_TOKEN_EVE_WEB) and never written to disk.
 set -euo pipefail
 
+eve_check_run_user() { # $1 account. Exists, is not admin, and is not root or uid 0.
+  local user=${1:-}
+  if [ -z "$user" ]; then
+    echo "EVE_RUN_USER is required: set it to the login account that owns the deploy directories and the runner." >&2
+    return 1
+  fi
+  if ! id "$user" >/dev/null 2>&1; then
+    echo "account $user does not exist" >&2
+    return 1
+  fi
+  if [ "$user" = root ] || [ "$(id -u "$user")" = 0 ]; then
+    echo "refusing: $user is root (uid 0). The runner must not be root." >&2
+    return 1
+  fi
+  if dscl . -read /Groups/admin GroupMembership 2>/dev/null | tr ' ' '\n' | grep -qx "$user"; then
+    echo "refusing: $user is an admin account. The runner must not be admin." >&2
+    return 1
+  fi
+  return 0
+}
+
+if [ "${1:-}" = --check-run-user ]; then
+  eve_check_run_user "${EVE_RUN_USER:-}" || exit 1
+  exit 0
+fi
+
 EVE_ROOT=${EVE_ROOT:-/opt/eve-gw}
-RUNNER_USER=${RUNNER_USER:-evedeploy}
+eve_check_run_user "${EVE_RUN_USER:-}" || exit 1
+RUNNER_USER=$EVE_RUN_USER
 OWNER=${EVE_OWNER:-gun025bba}
 RUNNER_VERSION=2.338.2
 RUNNER_ASSET=actions-runner-osx-arm64-$RUNNER_VERSION.tar.gz
 RUNNER_SHA256=25a065af409ffa317ab4d5a3b614dd15fc9c40f2172bc1b35a1b1258e919a388   # pinned: the download is refused if it differs
 HERE=$(cd "$(dirname "$0")" && pwd)
 
-[ "$(id -u)" = 0 ] || { echo "run with sudo: sudo bash host/setup.sh" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || { echo "run with sudo: sudo EVE_RUN_USER=<login-account> bash host/setup.sh" >&2; exit 1; }
 [ "$(uname -s)" = Darwin ] || { echo "this script is for the macOS host" >&2; exit 1; }
-id "$RUNNER_USER" >/dev/null 2>&1 || { echo "account $RUNNER_USER does not exist" >&2; exit 1; }
-if dscl . -read /Groups/admin GroupMembership 2>/dev/null | tr ' ' '\n' | grep -qx "$RUNNER_USER"; then
-  echo "refusing: $RUNNER_USER is an admin account. The runner must not be admin." >&2; exit 1
-fi
 
 echo "== 1/2 code directories owned by $RUNNER_USER"
 for d in bin web previous state; do mkdir -p "$EVE_ROOT/$d"; chown -R "$RUNNER_USER" "$EVE_ROOT/$d"; chmod -R go+rX "$EVE_ROOT/$d"; done
