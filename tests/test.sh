@@ -203,12 +203,15 @@ echo "$OUT" | grep -q 'EVE_RUN_USER is required' && ok "cutover one-liner says E
 mkdir -p "$T/idbin"
 cat >"$T/idbin/id" <<'SH'
 #!/bin/bash
+if [ "$1" = -un ]; then printf '%s\n' "${MOCK_ID_NAME:-login-account}"; exit 0; fi
+if [ "$1" = -u ] && [ -z "${2:-}" ]; then printf '%s\n' "${MOCK_ID_UID:-501}"; exit 0; fi
 user=$1
 if [ "$1" = -u ]; then user=$2; fi
 case "$user" in
   login-account) [ "$1" = -u ] && echo 501; exit 0 ;;
   toor) [ "$1" = -u ] && echo 0; exit 0 ;;
   adminuser) [ "$1" = -u ] && echo 501; exit 0 ;;
+  other-admin) [ "$1" = -u ] && echo 501; exit 0 ;;
 esac
 exit 1
 SH
@@ -216,7 +219,13 @@ cat >"$T/idbin/dscl" <<'SH'
 #!/bin/bash
 printf '%s\n' "${DSCL_MEMBERSHIP:-GroupMembership: root admin}"
 SH
-chmod +x "$T/idbin/id" "$T/idbin/dscl"
+cat >"$T/idbin/stat" <<'SH'
+#!/bin/bash
+if [ "${MOCK_CONSOLE_UNSET:-}" = 1 ]; then exit 0; fi
+if [ -n "${MOCK_CONSOLE_USER:-}" ]; then printf '%s\n' "$MOCK_CONSOLE_USER"; fi
+exit 0
+SH
+chmod +x "$T/idbin/id" "$T/idbin/dscl" "$T/idbin/stat"
 OUT=$(PATH="$T/idbin:$PATH" run_cutover EVE_RUN_USER=login-account)
 echo "$OUT" | grep -q 'install -d -o login-account ' && ok "cutover one-liner passes EVE_RUN_USER to install" || bad "cutover one-liner passes EVE_RUN_USER to install"
 echo "$OUT" | grep -q 'chown login-account ' && ok "cutover one-liner passes EVE_RUN_USER to chown" || bad "cutover one-liner passes EVE_RUN_USER to chown"
@@ -241,13 +250,27 @@ OUT=$(run_cutover EVE_RUN_USER=eve-no-such-account)
 check "cutover one-liner refuses a missing account" "$?" 1
 echo "$OUT" | grep -q 'account eve-no-such-account does not exist' && ok "cutover one-liner says the account does not exist" || bad "cutover one-liner says the account does not exist"
 echo "$OUT" | grep -q 'install -d' && bad "cutover one-liner stops before install for a missing account" || ok "cutover one-liner stops before install for a missing account"
-OUT=$(PATH="$T/idbin:$PATH" DSCL_MEMBERSHIP='GroupMembership: root admin adminuser' env EVE_RUN_USER=adminuser bash "$R/host/setup.sh" 2>&1)
-check "setup refuses an admin account" "$?" 1
-echo "$OUT" | grep -q 'refusing: adminuser is an admin account' && ok "setup says the admin account is refused" || bad "setup says the admin account is refused"
-OUT=$(PATH="$T/idbin:$PATH" DSCL_MEMBERSHIP='GroupMembership: root admin adminuser' run_cutover EVE_RUN_USER=adminuser)
-check "cutover one-liner refuses an admin account" "$?" 1
-echo "$OUT" | grep -q 'refusing: adminuser is an admin account' && ok "cutover one-liner says the admin account is refused" || bad "cutover one-liner says the admin account is refused"
-echo "$OUT" | grep -q 'install -d' && bad "cutover one-liner stops before install for an admin" || ok "cutover one-liner stops before install for an admin"
+OUT=$(PATH="$T/idbin:$PATH" DSCL_MEMBERSHIP='GroupMembership: root admin adminuser' env MOCK_ID_UID=501 MOCK_ID_NAME=adminuser EVE_RUN_USER=adminuser bash "$R/host/setup.sh" --check-run-user 2>&1)
+check "setup allows an admin account that is the current user" "$?" 0
+OUT=$(PATH="$T/idbin:$PATH" DSCL_MEMBERSHIP='GroupMembership: root admin adminuser' run_cutover MOCK_ID_UID=501 MOCK_ID_NAME=adminuser EVE_RUN_USER=adminuser)
+echo "$OUT" | grep -q 'install -d -o adminuser ' && ok "cutover one-liner allows an admin account that is the current user" || bad "cutover one-liner allows an admin account that is the current user"
+OUT=$(PATH="$T/idbin:$PATH" DSCL_MEMBERSHIP='GroupMembership: root admin other-admin' env MOCK_ID_UID=501 MOCK_ID_NAME=login-account EVE_RUN_USER=other-admin bash "$R/host/setup.sh" --check-run-user 2>&1)
+check "setup refuses an admin account that is not the current user" "$?" 1
+echo "$OUT" | grep -q 'refusing: other-admin is an admin account and is not the current user' && ok "setup says the other admin is not the current user" || bad "setup says the other admin is not the current user"
+OUT=$(PATH="$T/idbin:$PATH" DSCL_MEMBERSHIP='GroupMembership: root admin other-admin' run_cutover MOCK_ID_UID=501 MOCK_ID_NAME=login-account EVE_RUN_USER=other-admin)
+check "cutover one-liner refuses an admin account that is not the current user" "$?" 1
+echo "$OUT" | grep -q 'install -d' && bad "cutover one-liner stops before install for another admin" || ok "cutover one-liner stops before install for another admin"
+OUT=$(PATH="$T/idbin:$PATH" DSCL_MEMBERSHIP='GroupMembership: root admin adminuser' env -u SUDO_USER MOCK_ID_UID=0 MOCK_CONSOLE_USER=adminuser SUDO_USER=adminuser EVE_RUN_USER=adminuser bash "$R/host/setup.sh" --check-run-user 2>&1)
+check "sudo setup allows an admin account that matches SUDO_USER and the console user" "$?" 0
+OUT=$(PATH="$T/idbin:$PATH" DSCL_MEMBERSHIP='GroupMembership: root admin other-admin' env -u SUDO_USER MOCK_ID_UID=0 MOCK_CONSOLE_USER=login-account SUDO_USER=login-account EVE_RUN_USER=other-admin bash "$R/host/setup.sh" --check-run-user 2>&1)
+check "sudo setup refuses an admin account that is not SUDO_USER" "$?" 1
+echo "$OUT" | grep -q 'is not the sudo user' && ok "sudo setup says the admin is not the sudo user" || bad "sudo setup says the admin is not the sudo user"
+OUT=$(PATH="$T/idbin:$PATH" DSCL_MEMBERSHIP='GroupMembership: root admin adminuser' env -u SUDO_USER MOCK_ID_UID=0 MOCK_CONSOLE_USER=login-account SUDO_USER=adminuser EVE_RUN_USER=adminuser bash "$R/host/setup.sh" --check-run-user 2>&1)
+check "sudo setup refuses an admin account that is not the console user" "$?" 1
+echo "$OUT" | grep -q 'is not the console login account' && ok "sudo setup says the admin is not the console user" || bad "sudo setup says the admin is not the console user"
+OUT=$(PATH="$T/idbin:$PATH" DSCL_MEMBERSHIP='GroupMembership: root admin adminuser' env -u SUDO_USER MOCK_ID_UID=0 MOCK_CONSOLE_UNSET=1 EVE_RUN_USER=adminuser bash "$R/host/setup.sh" --check-run-user 2>&1)
+check "sudo setup refuses an admin account when both identities are unknown" "$?" 1
+echo "$OUT" | grep -q 'both unknown' && ok "sudo setup says both identities are unknown" || bad "sudo setup says both identities are unknown"
 # a socket directory other people can enter is refused (#265)
 chmod 755 "$(dirname "$EVE_CONTROL_SOCKET")"
 BEFORE=$(wc -l <"$T/sock.log" | tr -d ' ')

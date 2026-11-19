@@ -2,20 +2,50 @@
 # One-time host setup for tag-driven deploys. Run ONCE by an admin:
 #   sudo EVE_RUN_USER=<login-account> bash host/setup.sh
 # EVE_RUN_USER is required. The script exits with a clear error when it is unset.
-# It refuses a missing account, an admin account, root, and any account whose uid is 0.
+# It refuses a missing account, root, and any account whose uid is 0.
+# An admin account passes only when it is the real operator:
+#   --check-run-user (not root): EVE_RUN_USER must be the current user (id -un).
+#   sudo setup (root): EVE_RUN_USER must be SUDO_USER, and the console login user when that can be read.
+# If both of those root-path identities are unknown, or either one disagrees, the admin account is refused.
 #   EVE_RUN_USER=<login-account> bash host/setup.sh --check-run-user
 # checks the account and does nothing else. The cutover one-liner uses that.
 # Everything after this is automatic: a merge into main -> GitHub Actions -> this host's runner -> bin/deploy.
 #
 # What it does (nothing else; it does not touch config, data, secrets or a running supervisor):
 #   1. makes the runner account own the code directories under /opt/eve-gw, plus the supervisor release root and socket directory
-#   2. installs one self-hosted runner per repo (label "eve-host"), running as the non-admin account, outbound HTTPS only
+#   2. installs one self-hosted runner per repo (label "eve-host"), running as the login account, outbound HTTPS only
 #
 # Runner registration tokens come from GitHub (repo -> Settings -> Actions -> Runners -> New self-hosted runner), valid 1 hour.
 # They are read from the terminal (or from RUNNER_TOKEN_EVE_SERVING / RUNNER_TOKEN_EVE_WEB) and never written to disk.
 set -euo pipefail
 
-eve_check_run_user() { # $1 account. Exists, is not admin, and is not root or uid 0.
+eve_operator_matches() { # $1 account. 0 when that account is the real operator.
+  local user=$1 uid me console sudo_user
+  uid=$(id -u 2>/dev/null || true)
+  if [ "$uid" != 0 ]; then
+    me=$(id -un 2>/dev/null || true)
+    if [ -n "$me" ] && [ "$user" = "$me" ]; then return 0; fi
+    echo "refusing: $user is an admin account and is not the current user." >&2
+    return 1
+  fi
+  console=$(stat -f '%Su' /dev/console 2>/dev/null || true)
+  sudo_user=${SUDO_USER:-}
+  if [ -z "$sudo_user" ] && [ -z "$console" ]; then
+    echo "refusing: cannot identify the login account. SUDO_USER and the console user are both unknown." >&2
+    return 1
+  fi
+  if [ -n "$sudo_user" ] && [ "$sudo_user" != "$user" ]; then
+    echo "refusing: $user is an admin account and is not the sudo user." >&2
+    return 1
+  fi
+  if [ -n "$console" ] && [ "$console" != "$user" ]; then
+    echo "refusing: $user is an admin account and is not the console login account." >&2
+    return 1
+  fi
+  return 0
+}
+
+eve_check_run_user() { # $1 account. Exists, is not root or uid 0. An admin must be the real operator.
   local user=${1:-}
   if [ -z "$user" ]; then
     echo "EVE_RUN_USER is required: set it to the login account that owns the deploy directories and the runner." >&2
@@ -30,8 +60,7 @@ eve_check_run_user() { # $1 account. Exists, is not admin, and is not root or ui
     return 1
   fi
   if dscl . -read /Groups/admin GroupMembership 2>/dev/null | tr ' ' '\n' | grep -qx "$user"; then
-    echo "refusing: $user is an admin account. The runner must not be admin." >&2
-    return 1
+    eve_operator_matches "$user" || return 1
   fi
   return 0
 }
